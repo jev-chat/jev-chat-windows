@@ -77,6 +77,13 @@ def fill(hwnd, area, text):
     time.sleep(0.05)
     u32.SetCursorPos(old.x, old.y)
     time.sleep(0.05)
+    # 光标移到已有文本的绝对末尾：点击落在文字中间时 caret 会插在中间，
+    # 连续多次填入就串行错乱；Ctrl+End 保证新内容永远追加在最后
+    u32.keybd_event(0x11, 0, 0, 0)  # Ctrl 按下
+    u32.keybd_event(0x23, 0, 0, 0)  # End 按下（VK_END）
+    u32.keybd_event(0x23, 0, 2, 0)  # End 抬起
+    u32.keybd_event(0x11, 0, 2, 0)  # Ctrl 抬起
+    time.sleep(0.05)
     u32.keybd_event(0x11, 0, 0, 0)  # Ctrl
     u32.keybd_event(0x56, 0, 0, 0)  # V
     u32.keybd_event(0x56, 0, 2, 0)
