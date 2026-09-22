@@ -42,8 +42,10 @@ def target_of(title):
 
 
 def fill_reply(text):
-    if state["area"] is None or state["hwnd"] is None:  # 子进程重开过，hwnd 可能换了，用最新的
-        raise RuntimeError("微信输入区域尚不可用")
+    if state["hwnd"] is None:  # 子进程重开过，hwnd 可能换了，用最新的
+        raise RuntimeError("未找到微信窗口，请确认微信已打开")
+    if state["area"] is None:
+        raise RuntimeError("微信输入区域尚不可用，请确认微信聊天窗口可见（不要最小化）")
     if settings.reply_target() and ov.at_prefix_enabled():
         target = target_of(ov.current_chat())  # 填进去的是界面上正看着的那个会话的对象
         if target:

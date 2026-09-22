@@ -632,8 +632,12 @@ class Overlay:
             return
         try:
             self.on_fill(self.cands[index])
-        except Exception:
+        except Exception as e:
+            # 状态栏保持友好文案；真实原因和压缩堆栈进聊天记录，认得出是哪一步炸的
+            import traceback
             self.set_status("未能填入，请确认微信窗口可用后重试，或复制回复。", "error")
+            self.log(f"[填入失败] {type(e).__name__}: {e}")
+            self.log(f"[填入失败堆栈] {' '.join(traceback.format_exc().split())[:300]}")
             return
         self.set_status("已尝试填入，请在微信确认内容后发送。", "success")
 
