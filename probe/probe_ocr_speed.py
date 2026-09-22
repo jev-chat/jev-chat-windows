@@ -164,7 +164,11 @@ chat = full[y0:y1, x0:x1]
 CW, CH = x1 - x0, y1 - y0
 print(f"图 {W}x{H}，消息区 x{x0}-{x1} y{y0}-{y1} ({CW}x{CH})\n")
 
-e1 = RapidOCR(intra_op_num_threads=4, det_limit_type="max", det_limit_side_len=max(W, H))
+e1 = RapidOCR(intra_op_num_threads=4)  # det_limit_type 构造传参在 rapidocr 1.2.3 触发 KeyError，下面直接改预处理参数
+for op in e1.text_detector.preprocess_op:
+    if type(op).__name__ == "DetResizeForTest":
+        op.limit_type = "max"
+        op.limit_side_len = max(W, H)
 res = bench("limit=max 消息区", e1, chat)
 bench("limit=max 消息区底部 200px", e1, chat[-200:])
 bench("limit=max 消息区底部 120px", e1, chat[-120:])

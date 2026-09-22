@@ -12,10 +12,16 @@ _ENGINE = None
 
 def _engine():
     """OCR 引擎全进程共用：一个实例 ~40MB，每个会话一个 Reader，不能各带一个。
-    det_limit_type 默认 'min' 会把小图放大到短边 736，裁小反而更慢；必须 'max'。"""
+    det_limit_type 默认 'min' 会把小图放大到短边 736，裁小反而更慢；必须 'max'。
+    rapidocr-onnxruntime 1.2.3 的构造函数传 det_limit_type/det_limit_side_len 会触发
+    update_det_params 的 KeyError: 'model_path' bug，改为初始化后直接改预处理参数。"""
     global _ENGINE
     if _ENGINE is None:
-        _ENGINE = RapidOCR(intra_op_num_threads=4, det_limit_type="max", det_limit_side_len=4000)
+        _ENGINE = RapidOCR(intra_op_num_threads=4)
+        for op in _ENGINE.text_detector.preprocess_op:
+            if type(op).__name__ == "DetResizeForTest":
+                op.limit_type = "max"
+                op.limit_side_len = 4000
     return _ENGINE
 
 

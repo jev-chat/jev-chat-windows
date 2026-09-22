@@ -101,7 +101,11 @@ def who_said(chat, box):
 
 
 ctypes.windll.user32.SetProcessDPIAware()
-ocr = RapidOCR(intra_op_num_threads=4, det_limit_type="max", det_limit_side_len=4000)
+ocr = RapidOCR(intra_op_num_threads=4)  # det_limit_type 构造传参在 rapidocr 1.2.3 触发 KeyError，下面直接改预处理参数
+for op in ocr.text_detector.preprocess_op:
+    if type(op).__name__ == "DetResizeForTest":
+        op.limit_type = "max"
+        op.limit_side_len = 4000
 state = {"shape": None, "area": None, "bg": None, "last": None, "seen": [], "pending": None, "t": 0, "t0": 0, "lh": None, "shown": None}
 SETTLE = 0.25  # 秒：画面停稳这么久才 OCR，跳过滚动/新消息滑入的中间帧（半截气泡会认错、会重复）
 MAX_WAIT = 1.0  # 秒：画面一直在变（动图表情包）就永远停不稳，最多等这么久照样 OCR
