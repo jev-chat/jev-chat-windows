@@ -23,6 +23,16 @@
 
 本仓库不是上游项目的官方发行仓库。遇到本版本的问题，请在本仓库提交反馈；上游问题请前往原始项目反馈。
 
+## ⬇️ 立即下载便携版
+
+不需要安装 Python，也不需要下载源码：
+
+👉 **[立即下载 Windows 便携版 ZIP](https://github.com/MoYu-RJL/jev-chat-windows-community/releases/download/v0.0.0-community.1/jev-chat-windows-follow-model-optimized.zip)**（约 164 MB）
+
+📦 **[查看发行版说明与其他资源](https://github.com/MoYu-RJL/jev-chat-windows-community/releases/tag/v0.0.0-community.1)**
+
+下载后解压整个文件夹，保持 `jev-chat-windows.exe` 和 `_internal` 文件夹在一起，再双击 exe 启动。首次启动请填写你自己的 API Key；发布包不包含维护者的密钥、`config.json` 或聊天历史记录。
+
 微信/QQ（Windows）旁挂的回复辅助：本地 OCR 读屏上的对话 → 判断意图/情绪 → 给出 3 条候选回复 →
 一键填入聊天输入框。**发送永远手动，程序不替你按发送。**
 
@@ -33,9 +43,9 @@
 
 **普通使用直接下载，不用装 Python、不用碰源码。** 后面的「源码运行」是给开发者的。
 
-👉 **[下载社区版最新版](releases/latest)**（如果本仓库暂时没有 Release，请先按下面的源码运行或等待维护者发布）
+👉 **[下载社区增强版 v0.0.0-community.1](https://github.com/MoYu-RJL/jev-chat-windows-community/releases/tag/v0.0.0-community.1)**
 
-1. 在 Releases 页下载 `jev-chat-windows-vX.Y.Z.zip`（约 146 MB）
+1. 在发行版页面下载 `jev-chat-windows-follow-model-optimized.zip`（约 164 MB）
 2. 解压到一个固定目录（整个文件夹一起，exe 要用旁边那堆文件）
 3. 双击 `jev-chat-windows.exe`
 
