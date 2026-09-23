@@ -21,11 +21,15 @@ LLM_ENV = "LLM_API_KEY"    # 起草那把，不管选哪家语言模型
 # 迁移：老版本按来源各存一个变量。新变量空着、老变量有值就先用老的（保存时抄进新的）
 LEGACY = {JEV_ENV: "OPENROUTER_API_KEY", LLM_ENV: "DEEPSEEK_API_KEY"}
 
-_Jev = namedtuple("_Jev", "name default")
+_Jev = namedtuple("_Jev", "name base default")
 JEV_PROVIDERS = {
-    "openrouter": _Jev("OpenRouter", "typesafe/jev-1.13"),
-    "typesafe": _Jev("TypeSafe 直连", "jev-latest"),
+    "openrouter": _Jev("OpenRouter", OPENROUTER_DECISIONS, "typesafe/jev-1.13"),
+    "typesafe": _Jev("TypeSafe 直连", TYPESAFE_BASE, "jev-latest"),
+    "custom": _Jev("自定义 · 同协议", "", ""),  # 自建/代理/镜像，同 Jev 私有协议，Base URL 必填
 }
+# Jev 判断要在 Base URL 行里露地址的来源：设置页常驻这一行，切来源自动填表里的默认值，
+# 也能手改（typesafe 填代理、custom 填自建、openrouter 直接是 /decisions 完整地址）
+JEV_BASE = ("typesafe", "custom")
 
 # protocol ∈ {openai, anthropic, gemini}：决定 core/llm.py 用哪个官方 SDK
 # base 空 = 用 SDK 自带的默认地址（gemini），或者等用户自己填（自定义来源）

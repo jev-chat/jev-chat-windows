@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 try:
-    from .draft import draft_candidates
+    from . import draft as draft_mod
+    from .draft import draft_candidates, vision_transcribe
     from .jev_client import JevError, ask
     from .questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
 except ImportError:
-    from draft import draft_candidates
+    from . import draft as draft_mod
+    from draft import draft_candidates, vision_transcribe
     from jev_client import JevError, ask
     from questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
 
@@ -27,12 +29,16 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             timeout: float = 30, context: int = 10, provider: str = "deepseek",
             base_url: str | None = None, reply_to: str | None = None, style: str = "",
             thinking: bool = False, jev_provider: str = "openrouter",
-            jev_model: str | None = None) -> dict:
+            jev_model: str | None = None, draft_extra: dict | None = None,
+            jev_base_url: str | None = None, filter_noise: bool = False,
+            vision_image: bytes | None = None) -> dict:
     """messages: [(from, text)] from ∈ {her, me}，最新一条在最后；
     群聊里可以带第三项 name（说这句话的人），单聊不带。
     context: 起草和判断各看最近多少条消息（用户设置里的「参考上下文」）。
     provider: 起草走哪家（core.providers.DRAFT_PROVIDERS），base_url 只有自定义来源要传。
-    jev_provider / jev_model: 判断和排序走哪家、哪个模型（core.providers.JEV_PROVIDERS）。
+    jev_provider / jev_model: 判断和排序走哪家、哪个模型（core.providers.JEV_PROVIDERS）；
+    jev_base_url 只有 TypeSafe 直连认（代理/自建地址）。
+    draft_extra: 设置里「高级参数」的 JSON，浅合并进起草请求体。
     reply_to: 群聊里指定回复给谁；None = 正常回复。
     style: 用户自己描述的说话风格，只影响起草。
     thinking: 起草时是否开思考模式，只影响起草，默认关。
@@ -45,13 +51,23 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     三段式（issue #4）：先让 Jev 答 7 道判断题，把判断当小抄喂给起草，最后 Jev 只排序。
     判断那次挂了就退回老路：盲起草 + 判断和排序一次问完，行为跟以前一样。usage 是两次之和。
     """
+    if vision_image:
+        # 视觉模式：先让视觉模型把截图转写成消息列表（免 OCR 文字），判断和起草都用它
+        try:
+            transcribed = draft_mod.vision_transcribe(
+                vision_image, relationship, provider=provider, model=model, base_url=base_url,
+                timeout=timeout, extra_params=draft_extra)
+            if transcribed:
+                messages = transcribed[-context:] if context else transcribed
+        except JevError:
+            pass  # 转写失败退回 OCR 文字路线
     state = build_state(messages, relationship, keep=context, reply_to=reply_to)
     usage: dict = {}
     answers: dict = {}
     judged = False
     try:
         first = ask(state, dict(JUDGE_QUESTIONS), timeout=timeout,
-                    provider=jev_provider, model=jev_model)
+                    provider=jev_provider, model=jev_model, base_url=jev_base_url)
         answers = first.get("answers") or {}
         _add_usage(usage, first.get("usage"))
         judged = True
@@ -61,7 +77,13 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     candidates = draft_candidates(messages, relationship, provider=provider, model=model,
                                   base_url=base_url, timeout=timeout, keep=context,
                                   reply_to=reply_to, style=style, thinking=thinking,
-                                  guidance=guidance_text(answers) if judged else None)
+                                  guidance=guidance_text(answers) if judged else None,
+                                  extra_params=draft_extra, filter_noise=filter_noise,
+                                  vision_image=vision_image)
+    if not candidates:
+        # 过滤后候选全空：不抛的话下面 candidates[best_index] 会 IndexError，
+        # 界面只能显示通用失败提示；走 JevError 才能带上人话原因
+        raise JevError("三条候选全被过滤（对话可能全是系统通知或注入样本），稍后再试")
 
     questions = {} if judged else dict(JUDGE_QUESTIONS)
     if len(candidates) >= 2:  # 起草只给了 1 条就没什么可排的，判断题照问
@@ -69,7 +91,8 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     if questions:
         try:
             second = ask(state, questions, timeout=timeout,
-                         provider=jev_provider, model=jev_model)
+                         provider=jev_provider, model=jev_model,
+                         base_url=jev_base_url)
         except JevError:
             if not judged:  # 老路只有这一次调用，挂了就是挂了
                 raise

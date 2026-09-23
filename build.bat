@@ -12,7 +12,8 @@ if not exist ".venv\Scripts\python.exe" (
 call ".venv\Scripts\activate.bat" || goto :fail
 
 echo Installing dependencies ...
-python -m pip install -r requirements.txt pyinstaller || goto :fail
+REM Tsinghua PyPI mirror: much faster from mainland China; drop -i if you do not want it.
+python -m pip install -r requirements.txt pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple || goto :fail
 
 echo Building ...
 pyinstaller --noconfirm --clean jev.spec || goto :fail

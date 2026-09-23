@@ -69,8 +69,55 @@ def draft_model() -> str:
     return str(_read("draft_model") or "") or DRAFT_PROVIDERS[draft_provider()].default
 
 def draft_base_url() -> str:
-    """自定义来源的 Base URL；其余来源用表里的，这里返回空。"""
-    return str(_read("draft_base_url") or "") if draft_provider() in CUSTOM else ""
+    """起草请求的 Base URL；空 = 用来源表里的默认地址。设置页常驻这一行、切来源自动填默认值，
+    用户改过就按改的来（预设也能覆盖地址，比如换成镜像）。"""
+    return str(_read("draft_base_url") or "")
+
+def jev_base_url() -> str:
+    """判断请求的 Base URL；空 = 用来源表里的默认地址。同理可对任意来源手动覆盖。"""
+    return str(_read("jev_base_url") or "")
+
+def draft_extra() -> dict | None:
+    """起草请求的高级参数（用户填的 JSON），None = 没填或不是合法 JSON 对象；浅合并进请求体。"""
+    raw = draft_extra_text().strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) and data else None
+
+def draft_extra_text() -> str:
+    """高级参数的原文（设置页回显用），没填是空串。"""
+    return str(_read("draft_extra") or "")
+
+def snap_follow() -> bool:
+    """悬浮窗吸附跟随微信窗口：默认开。关了就停在用户拖到的地方。"""
+    return bool(_read("snap_follow", True))
+
+def bubble_layer() -> bool:
+    """微信聊天区气泡浮层（对方消息 + Jev 判断 + 三条候选画在微信上）：默认开。"""
+    return bool(_read("bubble_layer", True))
+
+def vision_draft() -> bool:
+    """起草用视觉模型读屏：开了以后聊天区截图直接发给起草模型（需模型支持图片输入）。
+    会话名识别和触发检测仍用本地 OCR——判断/排序也还需要文字。"""
+    return bool(_read("vision_draft", False))
+
+def filter_system_msgs() -> bool:
+    """过滤群聊系统通知（进群/退群/撤回/时间戳）：默认开。
+    开 = OCR 入口直接不进上下文 + 给起草模型注入忽略提示词；关 = 原样送进分析。"""
+    return bool(_read("filter_system_msgs", True))
+
+def bubble_offset():
+    """浮层被用户拖离默认锚点的偏移 [dx, dy]（逻辑 px）；None = 没拖过，用默认位置。"""
+    v = _read("bubble_offset")
+    try:
+        dx, dy = float(v[0]), float(v[1])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+    return (dx, dy)
 
 def reply_target() -> bool:
     """群聊指定回复对象：开了才在界面上选回复给谁、才把对象喂给模型。默认关。"""
@@ -138,11 +185,17 @@ has_key = has_jev_key  # 旧名字：界面上「配没配好」问的就是判�
 
 def save(relationship_text: str | None = None, context_n: int | None = None, *,
          jev_provider_text: str | None = None, jev_key_text: str | None = None,
-         jev_model_text: str | None = None, draft_provider_text: str | None = None,
+         jev_model_text: str | None = None, jev_base_url_text: str | None = None,
+         draft_provider_text: str | None = None,
          llm_key_text: str | None = None, draft_model_text: str | None = None,
-         draft_base_url_text: str | None = None, reply_target_on: bool | None = None,
+         draft_base_url_text: str | None = None, draft_extra_text: str | None = None,
+         reply_target_on: bool | None = None,
          style_text: str | None = None, thinking_on: bool | None = None,
-         check_update_on: bool | None = None, debug_view_on: bool | None = None) -> None:
+         check_update_on: bool | None = None, debug_view_on: bool | None = None,
+         snap_follow_on: bool | None = None, bubble_layer_on: bool | None = None,
+         filter_system_msgs_on: bool | None = None,
+         vision_draft_on: bool | None = None,
+         bubble_offset_pair: list | tuple | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -164,10 +217,23 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "jev_provider": jev, "jev_model": keep(jev_model_text, "jev_model"),
         "draft_provider": draft, "draft_model": keep(draft_model_text, "draft_model"),
         "draft_base_url": keep(draft_base_url_text, "draft_base_url"),
+        "jev_base_url": keep(jev_base_url_text, "jev_base_url"),
+        "draft_extra": keep(draft_extra_text, "draft_extra"),
         "reply_target": flag(reply_target_on, reply_target),
         "thinking": flag(thinking_on, thinking),
         "check_update": flag(check_update_on, check_update),
         "debug_view": flag(debug_view_on, debug_view),
+        "snap_follow": flag(snap_follow_on, snap_follow),
+        "bubble_layer": flag(bubble_layer_on, bubble_layer),
+        "filter_system_msgs": flag(filter_system_msgs_on, filter_system_msgs),
+        "vision_draft": flag(vision_draft_on, vision_draft),
+        # 浮层拖拽偏移：None = 原样保留；[dx, dy] = 存下（拖回默认位就存 [0, 0]，效果一样）
+        "bubble_offset": list(bubble_offset_pair) if bubble_offset_pair is not None
+        else (_read("bubble_offset") or [0, 0]),
     }
-    with open(_CONFIG, "w", encoding="utf-8") as f:
+    # 原子写：先写临时文件再 os.replace，中途崩了也不会留下半截 config.json
+    # （截断的 JSON 读出来是默认值，看起来就是「设置没保存」）
+    tmp = _CONFIG + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, _CONFIG)

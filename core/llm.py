@@ -9,6 +9,8 @@ SDK 都在函数里 import：桌面端一次只用到其中一家，启动时没
 """
 from __future__ import annotations
 
+import base64
+
 try:  # 当模块导入 / 当脚本直接跑 都能用
     from .jev_client import JevError, _fail
 except ImportError:
@@ -25,44 +27,63 @@ def _turns(user_turns: list[str], assistant: str = "assistant") -> list[dict]:
 
 
 def chat(protocol: str, base_url: str | None, api_key: str, model: str, system: str,
-         user_turns: list[str], *, temperature: float = 1.0, max_tokens: int = 400,
-         thinking: bool = False, extra_body: dict | None = None, timeout: float = 30) -> str:
+         user_turns: list[str], *, max_tokens: int = 400,
+         thinking: bool = False, extra_body: dict | None = None, timeout: float = 30,
+         images: list[bytes] | None = None,
+         temperature: float | None = None) -> str:
     """发一轮对话，返回模型输出的纯文本。
 
     user_turns: 用户/助手交替的文本，奇数条，首尾都是用户说的（追问补齐候选就是 3 条）。
     thinking: 思考模式。OpenAI 协议没有统一字段，各家自己的开关由调用方经 extra_body 带进来；
               anthropic / gemini 是协议自带的参数，这里直接处理。
+    extra_body: 用户填的高级参数（高级设置里的 JSON）。OpenAI / Anthropic 的官方 SDK 都认
+              extra_body（Stainless 系 SDK 的标准后门），浅合并进请求体；gemini 没有等价机制，忽略。
+    images: 附加到**最后一条用户消息**的图片（JPEG 字节）。视觉模型直接读图；非视觉模型
+            传入会报错，由调用方（设置里的视觉开关）保证只在该用时传。
+    temperature: None = 不在请求里带该字段——有的模型只认固定值，带上会 400。
     """
     if protocol == "anthropic":
         return _anthropic(base_url, api_key, model, system, user_turns,
-                          temperature, max_tokens, thinking, timeout)
+                          max_tokens, thinking, timeout, extra_body, images, temperature)
     if protocol == "gemini":
         return _gemini(base_url, api_key, model, system, user_turns,
-                       temperature, max_tokens, thinking, timeout)
+                       max_tokens, thinking, timeout, images, temperature)
     return _openai(base_url, api_key, model, system, user_turns,
-                   temperature, max_tokens, extra_body, timeout)
+                   max_tokens, extra_body, timeout, images, temperature)
 
 
-def _openai(base_url, api_key, model, system, user_turns, temperature, max_tokens,
-            extra_body, timeout) -> str:
+def _images_b64(images):
+    return [base64.b64encode(b).decode() for b in (images or [])]
+
+
+def _openai(base_url, api_key, model, system, user_turns, max_tokens,
+            extra_body, timeout, images=None, temperature=None) -> str:
     import openai
 
+    messages = [{"role": "system", "content": system}] + _turns(user_turns)
+    if images:  # 视觉输入：最后一条用户消息变成 text + image_url 混合内容
+        b64s = _images_b64(images)
+        messages[-1] = {"role": "user", "content":
+                        [{"type": "text", "text": user_turns[-1]}]
+                        + [{"type": "image_url",
+                            "image_url": {"url": "data:image/jpeg;base64," + b}} for b in b64s]}
     try:
         client = openai.OpenAI(base_url=base_url or None, api_key=api_key,
                                timeout=timeout, max_retries=2)
+        body = dict(model=model, messages=messages, max_tokens=max_tokens,
+                    stream=False)  # DeepSeek 要显式关；别家无所谓
+        if temperature is not None:  # 有的模型只认固定值/不收该字段：None = 不带
+            body["temperature"] = temperature
         resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": system}] + _turns(user_turns),
-            temperature=temperature, max_tokens=max_tokens,
-            stream=False,  # DeepSeek 要显式关；别家无所谓
+            **body,
             **({"extra_body": extra_body} if extra_body else {}))
     except Exception as exc:
         _fail(exc, "起草")
     return resp.choices[0].message.content or ""
 
 
-def _anthropic(base_url, api_key, model, system, user_turns, temperature, max_tokens,
-               thinking, timeout) -> str:
+def _anthropic(base_url, api_key, model, system, user_turns, max_tokens,
+               thinking, timeout, extra_body=None, images=None, temperature=None) -> str:
     import anthropic
 
     extra = {}
@@ -70,12 +91,22 @@ def _anthropic(base_url, api_key, model, system, user_turns, temperature, max_to
         extra["thinking"] = {"type": "enabled", "budget_tokens": _THINK_BUDGET}
         temperature = 1.0  # 开了思考，Anthropic 只收 temperature=1
         max_tokens = max(max_tokens, _THINK_BUDGET + 1024)  # max_tokens 得装得下思考 + 正文
+    turns = _turns(user_turns)
+    if images:  # 视觉输入：最后一条用户消息变成 image + text 混合内容
+        b64s = _images_b64(images)
+        turns[-1] = {"role": "user", "content":
+                     [{"type": "image",
+                       "source": {"type": "base64", "media_type": "image/jpeg", "data": b}}
+                      for b in b64s]
+                     + [{"type": "text", "text": user_turns[-1]}]}
     try:
         client = anthropic.Anthropic(base_url=base_url or None, api_key=api_key,
                                      timeout=timeout, max_retries=2)
-        message = client.messages.create(model=model, system=system,
-                                         messages=_turns(user_turns), max_tokens=max_tokens,
-                                         temperature=temperature, **extra)
+        body = dict(model=model, system=system, messages=turns, max_tokens=max_tokens)
+        if temperature is not None:
+            body["temperature"] = temperature
+        message = client.messages.create(**body, **extra,
+                                         **({"extra_body": extra_body} if extra_body else {}))
     except Exception as exc:
         _fail(exc, "起草")
     # 开了思考的话前面还有 thinking 块，只取文本块
@@ -93,16 +124,21 @@ def _gemini_client(base_url, api_key, timeout):
     return genai.Client(api_key=api_key, http_options=options), types
 
 
-def _gemini(base_url, api_key, model, system, user_turns, temperature, max_tokens,
-            thinking, timeout) -> str:
+def _gemini(base_url, api_key, model, system, user_turns, max_tokens,
+            thinking, timeout, images=None, temperature=None) -> str:
     try:
         client, types = _gemini_client(base_url, api_key, timeout)
         config = types.GenerateContentConfig(
-            system_instruction=system, temperature=temperature, max_output_tokens=max_tokens,
+            system_instruction=system, max_output_tokens=max_tokens,
             # thinking_budget=0 才是真的关掉；不传是让模型自己定（等于开着）
             thinking_config=None if thinking else types.ThinkingConfig(thinking_budget=0))
+        if temperature is not None:  # None = 不带该字段
+            config.temperature = temperature
         contents = [types.Content(role=m["role"], parts=[types.Part(text=m["content"])])
                     for m in _turns(user_turns, assistant="model")]  # Gemini 那边助手叫 model
+        if images:  # 视觉输入：图片挂到最后一条用户消息上
+            for b in images:
+                contents[-1].parts.append(types.Part.from_bytes(data=b, mime_type="image/jpeg"))
         resp = client.models.generate_content(model=model, contents=contents, config=config)
     except Exception as exc:
         _fail(exc, "起草")

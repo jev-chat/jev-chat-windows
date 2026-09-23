@@ -17,10 +17,10 @@ import urllib.request
 from typing import NoReturn
 
 try:  # 当模块导入 / 当脚本直接跑 都能用
-    from .providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY, OPENROUTER_BASE,
+    from .providers import (ENV_VARS, JEV_BASE, JEV_ENV, JEV_PROVIDERS, LEGACY, OPENROUTER_BASE,
                             OPENROUTER_DECISIONS, TYPESAFE_BASE)
 except ImportError:
-    from providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY, OPENROUTER_BASE,
+    from providers import (ENV_VARS, JEV_BASE, JEV_ENV, JEV_PROVIDERS, LEGACY, OPENROUTER_BASE,
                            OPENROUTER_DECISIONS, TYPESAFE_BASE)
 
 MAX_RETRIES = 3
@@ -86,18 +86,26 @@ def _error_body(exc: urllib.error.HTTPError) -> str:
 
 
 def ask(state: dict, questions: dict, timeout: float = 20,
-        provider: str = "openrouter", model: str | None = None) -> dict:
+        provider: str = "openrouter", model: str | None = None,
+        base_url: str | None = None) -> dict:
     """问 Jev 一轮判断，返回 {"answers": {名字: 答案}, "usage": {...}}。
 
-    provider ∈ JEV_PROVIDERS（openrouter / typesafe 直连）；model=None 用该来源的默认模型。
-    两条路返回的 dict 形状一模一样，429/529 都会退避重试。绝不打印或写出 key。
+    provider ∈ JEV_PROVIDERS（openrouter / typesafe 直连 / custom 同协议自建）；
+    model=None 用该来源的默认模型。base_url：typesafe 是可选的代理地址；custom 必填。
+    OpenRouter 和 custom 走同一条私有协议（POST {model, state, questions} 到
+    /api/alpha/decisions），返回的 dict 形状一模一样；typesafe 走官方 SDK，答案形状也对齐。
+    429/529 都会退避重试。绝不打印或写出 key。
     """
     spec = JEV_PROVIDERS.get(provider) or JEV_PROVIDERS["openrouter"]
-    key = _api_key(JEV_ENV)  # 两家共用同一把 key，换来源不用重填
+    key = _api_key(JEV_ENV)  # 各来源共用同一把判断 key，换来源不用重填
     model = model or spec.default
     if provider == "typesafe":
-        return _ask_typesafe(state, questions, key, model, timeout)
-    return _ask_openrouter(state, questions, key, model, timeout)
+        return _ask_typesafe(state, questions, key, model, timeout, base_url)
+    # openrouter / custom 走同一条私有协议；base_url 没填用 OpenRouter 官方地址，
+    # 填了就按它算（openrouter 填镜像、custom 填自建，同一个道理）
+    return _ask_decisions(_decisions_url(base_url) if (base_url or "").strip()
+                          else OPENROUTER_DECISIONS,
+                          state, questions, key, model, timeout)
 
 
 def _answer(answer) -> dict:
@@ -112,14 +120,16 @@ def _answer(answer) -> dict:
             "probabilities": {str(k): v for k, v in answer.probabilities.items()}}
 
 
-def _ask_typesafe(state: dict, questions: dict, key: str, model: str, timeout: float) -> dict:
+def _ask_typesafe(state: dict, questions: dict, key: str, model: str, timeout: float,
+                  base_url: str | None = None) -> dict:
     """官方 typesafe_sdk。questions 原样传：core/questions.py 里那几个 dict 本身就是 SDK 的
     NoulModel / ChoiceModel / ScoreModel（SDK 的 normalize_questions 认 dict），不用再包一层对象。
-    重试用 RetryPolicy 的默认值——它本来就重试 408/429/5xx（含 529）并退避。"""
+    base_url 空 = 表里的默认地址，填了 = 代理/自建。重试用 RetryPolicy 的默认值——它本来就重试
+    408/429/5xx（含 529）并退避。"""
     import typesafe_sdk
 
     try:
-        with typesafe_sdk.TypeSafeClient(api_key=key, base_url=TYPESAFE_BASE, model=model,
+        with typesafe_sdk.TypeSafeClient(api_key=key, base_url=base_url or TYPESAFE_BASE, model=model,
                                          timeout=timeout) as client:
             result = client.system_one(state, questions, model=model)
     except Exception as exc:
@@ -131,8 +141,18 @@ def _ask_typesafe(state: dict, questions: dict, key: str, model: str, timeout: f
     }
 
 
-def _ask_openrouter(state: dict, questions: dict, key: str, model: str, timeout: float) -> dict:
-    """OpenRouter 的 /api/alpha/decisions，手写 urllib。429/529 退避重试 3 次。"""
+def _decisions_url(base_url: str) -> str:
+    """私有协议的完整地址：给 base 补 /api/alpha/decisions；已经写到 /decisions 的照用。"""
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        raise JevError("自定义判断来源要填 Base URL")
+    return base if base.endswith("/decisions") else base + "/api/alpha/decisions"
+
+
+def _ask_decisions(url: str, state: dict, questions: dict, key: str, model: str,
+                   timeout: float) -> dict:
+    """Jev 私有协议：POST {model, state, questions}，返回 JSON。OpenRouter 官方和自定义
+    （代理/镜像/自建，同协议）都走这一条。429/529 退避重试 3 次。"""
     payload = json.dumps(
         {"model": model, "state": state, "questions": questions},
         ensure_ascii=False,
@@ -142,7 +162,7 @@ def _ask_openrouter(state: dict, questions: dict, key: str, model: str, timeout:
     last_body = ""
     for attempt in range(MAX_RETRIES + 1):
         req = urllib.request.Request(
-            OPENROUTER_DECISIONS,
+            url,
             data=payload,
             method="POST",
             headers={
@@ -185,22 +205,30 @@ def _ask_openrouter(state: dict, questions: dict, key: str, model: str, timeout:
     )
 
 
-def list_models(provider: str, key: str, timeout: float = 10) -> list[str]:
+def list_models(provider: str, key: str, timeout: float = 10,
+                base_url: str | None = None) -> list[str]:
     """某家能用的 Jev 模型 id，去重排序。失败抛 JevError（设置页直接显示这句话）。"""
     if provider == "typesafe":
         import typesafe_sdk
 
         try:
-            with typesafe_sdk.TypeSafeClient(api_key=key, base_url=TYPESAFE_BASE,
+            with typesafe_sdk.TypeSafeClient(api_key=key, base_url=base_url or TYPESAFE_BASE,
                                              timeout=timeout) as client:
                 return sorted({m.name for m in client.models.list().models})
         except Exception as exc:
             _fail(exc, "取模型列表")
+    if provider == "custom":
+        if not (base_url or "").strip():
+            raise JevError("自定义判断来源要填 Base URL")
+        from .llm import list_models as _models
+        return _models("openai", base_url, key, timeout)
     try:  # 只在这儿 import：llm 模块头上要 jev_client 的 _fail，放模块级就转圈了
         from .llm import list_models as _models
     except ImportError:
         from llm import list_models as _models
-    # OpenRouter 上几百个模型，只有 typesafe/ 这几个是 Jev
+    if base_url:  # openrouter 换成了镜像：地址跟设置页里填的走，全量返回（镜像上没有 typesafe/ 前缀约定）
+        return _models("openai", base_url, key, timeout)
+    # OpenRouter 官方上几百个模型，只有 typesafe/ 这几个是 Jev
     return [i for i in _models("openai", OPENROUTER_BASE, key, timeout)
             if i.startswith("typesafe/")]
 

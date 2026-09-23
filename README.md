@@ -87,13 +87,21 @@ DeepSeek 官方 API（`api.deepseek.com`）国内直连，起草基本就是一�
   每条都有「填入微信」和复制按钮。
 - **判断摘要**：建议动作、可能意图、对方可能需要、紧张度 0–9。
 - **采集开关**：标题栏一拨就停，WGC 会话一起停掉（Win10 的黄框跟着消失），已有候选不受影响。
-- **实时聊天记录**：底部展开，看 OCR 到底读出了什么，认错了一眼就能发现。
+- **实时聊天记录**：底部展开，气泡样式——对方靠左白底、你靠右绿底，每轮判断后跟一条灰色
+  「Jev」泡（意图 / 建议 / 紧张度 / 推荐候选），像多了一个懂心的群友。认错了一眼就能发现。
+- **微信内气泡浮层**：把对方最新消息、Jev 判断和三条候选直接画在微信聊天区上（浮在消息区、
+  点候选即填入），跟微信同视觉层——微信被盖住它也跟着被盖。设置里可关。
 - **调试视图**（可选）：另开一个窗口，实时画出截到的画面和每个识别框——绿 = 我、蓝 = 对方、
   灰 = 过滤掉的灰字、橙 = 当成发言人名、红 = 当成图片丢掉、黄 = 小字丢掉，外加消息区和头部的框、
   OCR 耗时、这一帧读出来的每一行。识别不对时一眼看出是哪一步的锅。只在内存里画，不存图。
-- **两个模型都能换**：判断走 OpenRouter 或 TypeSafe 直连；起草有 11 家预设（默认 DeepSeek 官网），
+- **两个模型都能换**：判断走 OpenRouter、TypeSafe 直连，或自定义同协议地址（`/api/alpha/decisions`
+  的代理/自建，Base URL 和模型都可换）；起草有 11 家预设（默认 DeepSeek 官网），
   OpenAI / Anthropic / Gemini 三种协议都支持，也能填自己的 Base URL。全程只要两把 key。
 - **思考模式开关**：默认关；开了模型先想再写，更斟酌但慢好几倍、贵一些。
+- **起草高级参数**（可选）：填一段 JSON（如 `{"temperature": 0.9}`）浅合并进请求体，
+  OpenAI / Anthropic 协议生效。
+- **吸附跟随微信窗口**：悬浮窗自动贴在微信旁边，微信挪它也跟着挪（设置里可关；
+  自己拖走之后就不再自动挪，重新保存设置才恢复）。
 - **参考上下文条数**：3~30，默认 10，起草和判断都按它取最近 N 条。
 - **说话风格**：一句话描述自己的口吻，补在「照着你最近发的消息模仿」之上。
 - **响应式悬浮窗**：置顶、可拖可缩，最小 320×360，窄于 400 进紧凑模式。
@@ -161,6 +169,7 @@ WGC 截微信窗口（GPU 合成窗口也能截，被遮挡也能截）
 | --- | --- | --- |
 | OpenRouter（默认） | `openrouter.ai/api/alpha/decisions` | `typesafe/jev-1.13` |
 | TypeSafe 直连 | `api.typesafe.ai`（官方 `typesafe-sdk`） | `jev-latest` |
+| 自定义 · 同协议 | 自己填 Base URL（自动补 `/api/alpha/decisions`），代理/自建/镜像都行 | 无，要自己填 |
 
 **起草 3 条候选（key：`LLM_API_KEY`）**
 
@@ -233,9 +242,11 @@ git clone https://github.com/jev-chat/jev-chat-windows.git
 cd jev-chat-windows
 python -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 python main.py
 ```
+
+> 国内网络建议像上面这样走清华镜像装依赖，快很多。`build.bat` 里已经默认带了这个镜像参数。
 
 PyCharm / VS Code 里直接 Run `main.py` 也行。
 
@@ -248,7 +259,7 @@ PyCharm / VS Code 里直接 Run `main.py` 也行。
 双击 `build.bat`（没有 `.venv` 会自己建一个，装依赖、调 PyInstaller，一路到底），或者手动：
 
 ```bash
-pip install -r requirements.txt pyinstaller
+pip install -r requirements.txt pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
 pyinstaller --noconfirm --clean jev.spec
 ```
 
@@ -268,11 +279,13 @@ pyinstaller --noconfirm --clean jev.spec
 | 群聊指定回复对象 | 开了群聊里才有「回复对象」那一行，候选针对 TA 写 | `config.json` → `reply_target`（默认关） |
 | 启动时检查更新 | 开了才在启动时查一次 GitHub 最新版本号，有新版本就在标题栏下面提示 | `config.json` → `check_update`（默认开） |
 | 调试视图 | 另开一个窗口实时显示截到的画面和识别框，看识别在哪一步认错。拨一下立刻生效，不用点保存；关掉那个窗口等于关掉开关 | `config.json` → `debug_view`（默认关） |
-| 判断 · 来源 | OpenRouter 还是 TypeSafe 直连 | `config.json` → `jev_provider`（默认 `openrouter`） |
+| 吸附跟随微信窗口 | 悬浮窗自动贴在微信窗口旁边，微信挪它也跟着挪（高 DPI 已按缩放换算） | `config.json` → `snap_follow`（默认开） |
+| 判断 · 来源 | OpenRouter / TypeSafe 直连 / 自定义同协议 | `config.json` → `jev_provider`（默认 `openrouter`） |
+| 判断 · Base URL | 常驻，切来源自动填默认地址，可手改成代理/镜像 | `config.json` → `jev_base_url` |
 | 判断 · 密钥 | 上面选哪家就填哪家的 key。已配置时留空 = 保留 | 注册表 `HKCU\Environment` → `JEV_API_KEY` |
 | 判断 · 模型 | 可手打，也可点「获取模型」拉列表挑 | `config.json` → `jev_model`（空 = 该来源默认） |
 | 起草 · 来源 | 上面那张表里的任意一家 | `config.json` → `draft_provider`（默认 `deepseek`） |
-| 起草 · Base URL | 只有两个「自定义」来源才出现这一行 | `config.json` → `draft_base_url` |
+| 起草 · Base URL | 常驻，切来源自动填默认地址，可手改成镜像/代理 | `config.json` → `draft_base_url` |
 | 起草 · 密钥 | 上面选哪家就填哪家的 key。已配置时留空 = 保留 | 注册表 `HKCU\Environment` → `LLM_API_KEY` |
 | 起草 · 模型 | 可手打，也可点「获取模型」拉列表挑 | `config.json` → `draft_model`（空 = 该来源默认） |
 | 起草时开启思考模式 | 开了模型先想再写，慢好几倍、贵一些 | `config.json` → `thinking`（默认关） |

@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 """浅色置顶回复助手：回复建议和独立设置页。发送始终由用户在微信确认。"""
+import ctypes
+import ctypes.wintypes
+import json
 import threading
 from datetime import datetime
 from math import isfinite
@@ -12,13 +15,14 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
-    BodyLabel, CardWidget, CheckBox, ComboBox, EditableComboBox, FluentIcon as FIF,
-    HyperlinkButton, IndeterminateProgressBar, LineEdit, PasswordLineEdit, PlainTextEdit,
+    BodyLabel, CardWidget, CheckBox, ComboBox, DoubleSpinBox, EditableComboBox, FluentIcon as FIF,
+    HyperlinkButton, IndeterminateProgressBar, LineEdit, PasswordLineEdit,
     PrimaryPushButton, PushButton, ScrollArea, SpinBox, SwitchButton, Theme, TransparentToolButton,
     setCustomStyleSheet, setFont, setTheme, setThemeColor,
 )
 
 from app import settings
+from app.noise import is_system_noise
 from app.version import VERSION
 from core import jev_client, llm, providers
 from core.questions import CHOICE_LABELS
@@ -34,6 +38,40 @@ _RELATIONSHIPS = [
 
 def _choice(answers, name):
     return CHOICE_LABELS[name].get((answers.get(name) or {}).get("choice"), "暂未判断")
+
+
+def judgment_lines(result):
+    """一轮分析结果 → Jev 气泡的多行明细（微信内浮层用）。
+    不带「推荐」行：三条候选就在下面的绿泡里（✓ 已标出），重复一遍反而像多出一条不相干的。"""
+    answers = result.get("answers") or {}
+    lines = [f"意图 · {_choice(answers, 'true_intent')}",
+             f"建议 · {_choice(answers, 'best_action')}",
+             f"需要 · {_choice(answers, 'she_needs')}"]
+    score = (answers.get("danger_level") or {}).get("score")
+    if isinstance(score, (int, float)) and isfinite(score) and 0 <= score <= 9:
+        lines.append(f"紧张度 {score:.0f}/9")
+    return lines
+
+
+def judgment_text(result):
+    """一轮分析结果 → 「Jev 判断」气泡的摘要文字：意图 / 建议 / 需要 / 紧张度一行，推荐候选一行。"""
+    answers = result.get("answers") or {}
+    head = (f"意图 {_choice(answers, 'true_intent')} · 建议 {_choice(answers, 'best_action')}"
+            f" · 需要 {_choice(answers, 'she_needs')}")
+    score = (answers.get("danger_level") or {}).get("score")
+    if isinstance(score, (int, float)) and isfinite(score) and 0 <= score <= 9:
+        head += f" · 紧张度 {score:.0f}/9"
+    lines = [head]
+    cands = result.get("candidates") or []
+    best = result.get("best_index", 0)
+    if cands and best in range(len(cands)):
+        tip = f"推荐：「{cands[best]}」"
+        raw = result.get("scores") or []
+        p = raw[best] if best < len(raw) else None
+        if isinstance(p, (int, float)) and p:
+            tip += f" {round(p * 100)}%"
+        lines.append(tip)
+    return "\n".join(lines)
 
 
 def _label(text="", size=14, color=None, bold=False, parent=None):
@@ -81,11 +119,18 @@ class _Fetched(QObject):
     done = Signal(object, list, str)
 
 
+class _Tested(QObject):
+    """配置测试的后台线程 → 主线程：哪一组、成功否、给人看的说明。"""
+    done = Signal(object, bool, str)
+
+
 class _TitleBar(QWidget):
-    """只有标题栏可拖动，选择正文或按按钮不会意外移动窗口。"""
-    def __init__(self, parent):
+    """只有标题栏可拖动，选择正文或按按钮不会意外移动窗口。
+    拖完回调一下：悬浮窗从「吸附跟随」切到「用户钉住了」，不再自动挪，直到重新保存设置。"""
+    def __init__(self, parent, on_drag_end=None):
         super().__init__(parent)
         self._drag = None
+        self._on_end = on_drag_end
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -98,6 +143,8 @@ class _TitleBar(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._drag is not None and self._on_end:
+            self._on_end()
         self._drag = None
         super().mouseReleaseEvent(event)
 
@@ -149,12 +196,268 @@ class _ReplyCard(_Surface):
         self.fillButton.setMinimumWidth(80 if compact else 100)
 
 
+class _BubbleLayer(QWidget):
+    """透明浮层：铺在微信消息区上，照着聊天软件的样子画气泡——
+    对方消息（白，左）→ Jev 判断（灰，左，多行明细）→ 三条候选（绿，右，可点即填入）。
+    无任务栏图标、点击不抢焦点；Z 序由 main 钉在微信正上方，跟微信同视觉层。
+    可整块拖拽：松手保存相对默认锚点的偏移（settings.bubble_offset），之后每拍定位都用它。"""
+
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setCursor(Qt.SizeAllCursor)  # 提示整块可拖
+        self._drag_off = None  # 拖拽中：按下的全局位置 - 窗口位置
+        self._dragging = False  # 拖拽中 place() 不许抢位置
+        self._anchor = None  # 默认锚点（拖拽偏移的参照，place 每次刷新）
+        self.refresh_btn = None  # set_content 里创建
+        self._spin_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        self._spin_i = 0
+        self._spin_timer = QTimer(self)
+        self._spin_timer.setInterval(120)
+        self._spin_timer.timeout.connect(self._spin_tick)
+        self.box = QVBoxLayout(self)
+        self.box.setContentsMargins(6, 4, 6, 6)
+        self.box.setSpacing(8)
+        self.box.addStretch(1)  # 气泡都沉底，像刚发生的对话
+
+    def set_generating(self, busy):
+        """生成中：按钮转菊花动画并禁用（点了有反应看得见），结束自动恢复。"""
+        if self.refresh_btn is None:
+            return
+        if busy:
+            self.refresh_btn.setEnabled(False)
+            self._spin_i = 0
+            self.refresh_btn.setText(f"{self._spin_frames[0]} 生成中")  # 立刻有反馈，不等第一拍
+            self._spin_timer.start()
+        else:
+            self._spin_timer.stop()
+            self.refresh_btn.setEnabled(True)
+            self.refresh_btn.setText("↻ 重新生成")
+
+    def _spin_tick(self):
+        if self.refresh_btn is not None and not self.refresh_btn.isEnabled():
+            self._spin_i = (self._spin_i + 1) % len(self._spin_frames)
+            self.refresh_btn.setText(f"{self._spin_frames[self._spin_i]} 生成中")
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_off = e.globalPosition().toPoint() - self.pos()
+            self._dragging = True
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._dragging and self._drag_off is not None:
+            self.move(e.globalPosition().toPoint() - self._drag_off)
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._dragging:
+            self._dragging = False
+            anchor = self._anchor or (self.x(), self.y())
+            self.owner.save_bubble_offset(self.x() - anchor[0], self.y() - anchor[1])
+        super().mouseReleaseEvent(e)
+
+    def _clear(self):
+        """清空重建。注意 count()>1 的写法是错的：第一个 item 是 stretch 弹簧（没有 widget），
+        先把它弹出去就会永远留下最后一轮的旧面板——上一轮结果残留就是这么来的。"""
+        while self.box.count():
+            item = self.box.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.box.addStretch(1)  # 弹簧放回末尾：面板永远沉底
+
+    @staticmethod
+    def _bubble_card(bg, border, max_w):
+        card = QFrame()
+        card.setObjectName("bubbleCard")
+        qss = f"QFrame#bubbleCard {{ background: {bg}; border-radius: 4px 12px 12px 12px;"
+        if border:
+            qss += f" border: 1px solid {border};"
+        card.setStyleSheet(qss + " }")
+        card.setMaximumWidth(max_w)
+        inner = QVBoxLayout(card)
+        inner.setContentsMargins(9, 5, 9, 6)
+        inner.setSpacing(1)
+        return card, inner
+
+    def _row(self, card, right=False):
+        """一行气泡：默认靠左（对方/Jev），right=True 靠右（我的候选）。"""
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        if right:
+            row.addStretch(1)
+            row.addWidget(card)
+        else:
+            row.addWidget(card)
+            row.addStretch(1)
+        wrap = QWidget()
+        wrap.setLayout(row)
+        self.box.addWidget(wrap)
+
+    @staticmethod
+    def _norm(t):
+        import re
+        return re.sub(r"[\s\W_]+", "", t or "").lower()
+
+    def set_content(self, her, lines, result):
+        """全部内容合并成**一块**半透明面板（不再分散）：
+        对方最新消息 → Jev 分析 → 三条候选（每行可点，✓ 为推荐），中间细分隔线。
+        对方原文永远显示；复读对方消息的候选直接不画。"""
+        self._clear()
+        panel_w = max(240, (self.width() or 280) - 4)
+        her_n = self._norm(her)
+
+        panel = QFrame()
+        panel.setObjectName("bubbleCard")
+        panel.setStyleSheet(
+            "QFrame#bubbleCard { background: rgba(248, 250, 248, 205);"
+            " border: 1px solid rgba(0, 0, 0, 25); border-radius: 10px; }")
+        panel.setMaximumWidth(panel_w)
+        inner = QVBoxLayout(panel)
+        inner.setContentsMargins(7, 5, 7, 4)
+        inner.setSpacing(1)
+
+        if her:
+            head = _label("对方", 10, "#8a9a90", True)
+            inner.addWidget(head)
+            # 原文只显示前 50 字：面板高度有限，塞下全文会把候选挤出可视区
+            her_show = her if len(her) <= 50 else her[:50] + "…"
+            her_label = _label(her_show, 12, "#233c2f")
+            her_label.setToolTip(her)  # 完整内容悬停可看
+            inner.addWidget(her_label)
+            inner.addWidget(self._divider())
+
+        # Jev 抬头行：左边标题，右边小「重新生成」按钮（点击不抢焦点，走首页同一条刷新链路）
+        jrow = QHBoxLayout()
+        jrow.setContentsMargins(0, 0, 0, 0)
+        jrow.setSpacing(4)
+        jrow.addWidget(_label("Jev:", 10, "#68776f", True))
+        jrow.addStretch(1)
+        refresh = PushButton("↻ 重新生成", self)
+        refresh.setStyleSheet(
+            "QPushButton { background: transparent; border: none; border-radius: 6px;"
+            " padding: 1px 6px; font-size: 10px; color: #68776f; }"
+            "QPushButton:hover { background: rgba(149, 236, 105, 90); color: #18794e; }")
+        refresh.setCursor(Qt.PointingHandCursor)
+        refresh.setToolTip("用当前聊天记录再生成一轮建议")
+        refresh.clicked.connect(lambda _=False: self.owner._refresh_clicked())
+        jrow.addWidget(refresh)
+        self.refresh_btn = refresh
+        inner.addLayout(jrow)
+        for text in lines:
+            inner.addWidget(_label(text, 12, "#42574a"))
+        if result.get("candidates"):
+            inner.addWidget(self._divider())
+
+        cands = result.get("candidates") or []
+        best = result.get("best_index", 0)
+        raw = result.get("scores") or []
+        order = sorted(range(len(cands)), key=lambda i: (i != best, -(raw[i] if i < len(raw) else 0), i))
+        shown = 0
+        for index in order:
+            if shown >= 3:
+                break
+            cand_n = self._norm(cands[index])
+            if her_n and (cand_n in her_n or her_n in cand_n):
+                continue  # 复读对方消息的候选直接不画
+            score = raw[index] if index < len(raw) else None
+            circ = "①②③④⑤"[shown]  # 圆序号按显示顺序
+            mark = "✓" if index == best else ""
+            pct = f"{round(score * 100)}%" if score else ""
+
+            row = QFrame()
+            row.setObjectName("candRow")
+            row.setCursor(Qt.PointingHandCursor)
+            row.setStyleSheet(
+                "QFrame#candRow { background: transparent; border-radius: 6px; }"
+                "QFrame#candRow:hover { background: rgba(149, 236, 105, 90); }")
+            rbox = QHBoxLayout(row)
+            rbox.setContentsMargins(5, 2, 5, 2)
+            rbox.setSpacing(4)
+            # 四列：对勾（固定宽、只有推荐行有）→ 圆序号（固定宽左对齐）→ 文字（伸缩）→ 百分比（右对齐）
+            mark_label = _label(mark, 12, "#18794e", True)
+            mark_label.setFixedWidth(12)
+            mark_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            rbox.addWidget(mark_label)
+            circ_label = _label(circ, 12, "#233c2f")
+            circ_label.setFixedWidth(16)
+            circ_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            rbox.addWidget(circ_label)
+            # 候选超过 60 字截断（悬停看全文）：换行两行内保证三条候选都在可视区
+            cand_show = cands[index] if len(cands[index]) <= 60 else cands[index][:60] + "…"
+            text_label = _label(cand_show, 12, "#233c2f")
+            text_label.setToolTip(cands[index])
+            text_label.setCursor(Qt.PointingHandCursor)
+            rbox.addWidget(text_label, 1)
+            pct_label = _label(pct, 11, "#68776f")
+            pct_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)  # 百分比右对齐
+            pct_label.setCursor(Qt.PointingHandCursor)
+            rbox.addWidget(pct_label)
+            # 整行接收点击（行是 QFrame 不吃鼠标，手动转发到 _fill）
+            row.mousePressEvent = lambda _e, i=index: self._fill(i)
+            inner.addWidget(row)
+            shown += 1
+        if shown or True:  # 面板始终只有一块
+            self.box.addWidget(panel)
+        # 固定用 place 算好的尺寸：adjustSize 会把窗撑回内容高
+        self.resize(*getattr(self, "_placed", (self.width(), self.height())))
+
+    @staticmethod
+    def _divider():
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setStyleSheet("background: rgba(0, 0, 0, 22); border: none;")
+        return line
+
+    def _fill(self, index):
+        """点候选气泡：直接走填入回调（点击不抢焦点，微信保持前台）。"""
+        result = self.owner._bubble_result
+        if not result:
+            return
+        cands = result.get("candidates") or []
+        if index >= len(cands):
+            return
+        try:
+            self.owner.on_fill(cands[index])
+        except Exception:
+            pass
+
+    def place(self, area):
+        """按微信消息区矩形（屏幕物理 px）把自己固定在聊天区**右上**：
+        贴右缘 2px、完全贴住聊天区上边缘，高度不超过消息区高的一半——
+        不遮下方自己刚发的消息。默认锚点之外叠加用户拖出的偏移
+        （settings.bubble_offset，松手即存，重启不变）。拖拽进行中不抢位置。"""
+        x0, y_top, x1, y_in = area
+        dpr = QApplication.instance().primaryScreen().devicePixelRatio() or 1.0
+        w = max(216, min(316, round((x1 - x0) / dpr) - 36))  # 比消息区窄 2 个中文字符
+        # 高度 = 消息区高度 - 120：底部留出自己最新的消息和输入框，其余全给面板（原文不再被挤掉）
+        avail_h = round((y_in - y_top) / dpr)
+        h = min(290, max(160, avail_h - 120))
+        self._placed = (w, h)
+        x = round(x1 / dpr) - w - 2
+        y = round(y_top / dpr)  # 完全贴住聊天区上边缘
+        self._anchor = (x, y)
+        off = settings.bubble_offset()
+        if off:
+            x, y = x + round(off[0]), y + round(off[1])
+        screen = self.screen().availableGeometry()
+        x = max(screen.left(), min(screen.right() + 1 - w, x))  # 偏移也不许拖出屏幕
+        y = max(screen.top(), min(screen.bottom() + 1 - h, y))
+        if not self._dragging:  # 拖拽中每 250ms 的自动定位闭嘴，松手后按新偏移接手
+            self.resize(w, h)
+            self.move(x, y)
+        if not self.isVisible():
+            self.show()
+
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
-                 on_toggle_debug=None):
+                 on_toggle_debug=None, on_refresh=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
-        on_toggle_debug(开不开) → 开关调试视图那个独立窗口。"""
+        on_toggle_debug(开不开) → 开关调试视图那个独立窗口。
+        on_refresh() → 首页「重新生成」按钮：用当前会话已有记录再跑一轮分析。"""
         self.app = QApplication.instance() or QApplication([])
         setTheme(Theme.LIGHT)
         setThemeColor(_GREEN, save=False)
@@ -162,6 +465,7 @@ class Overlay:
         self.on_toggle_capture = on_toggle_capture
         self.on_target_change = on_target_change
         self.on_toggle_debug = on_toggle_debug
+        self.on_refresh = on_refresh
         self.result_of = result_of
         self.cands = []
         self.cards = []
@@ -176,10 +480,20 @@ class Overlay:
         self.targets = {}  # {会话名: ([发言人], 当前回复对象)}
         self._chat = ""  # 微信当前开着的会话
         self._shown = ""  # 界面上正在看的会话（浏览时和上面不一样）
+        self._pinned = False  # 用户拖过悬浮窗就停在原地，微信窗口一动自动恢复跟随
+        self._pin_rect = None  # 拖走时记下微信矩形，变了就解钉
+        self._last_rect = None  # 最近一次见到的微信矩形（磁吸判断用）
+        self._border = None  # 悬浮窗自己的不可见边框（物理 px，首次吸附时量）
+        self._bubble = None  # 微信聊天区的气泡浮层（懒创建）
+        self._bubble_key = None  # 浮层当前内容对应的 (会话, 结果)，变了才重画
+        self._bubble_result = None  # 浮层里候选对应的结果（点击填入用）
+        self._bubble_errors = {}  # {会话名: 失败原因}——生成失败时浮层显示它，而不是留着旧建议
+        self._loading = False  # 回显设置中：开关 setChecked 会触发即时保存，装载期间必须拦住，
+        # 不然回显到一半的默认值会把已经存好的设置冲掉（「设置有时候未持久化」的真凶）
         self.win = _MainWindow(self._relayout)
         self.win.setObjectName("assistantWindow")
         self.win.setWindowTitle("Jev · 微信回复助手")
-        self.win.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.win.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)  # 不置顶：Z 序钉在微信正下方（main.py）
         self.win.setStyleSheet(
             "QWidget#assistantWindow { background: #f5f7f6; border: 1px solid #dce3de; border-radius: 14px; }"
         )
@@ -188,7 +502,7 @@ class Overlay:
         outer = QVBoxLayout(self.win)
         outer.setContentsMargins(1, 1, 1, 1)
         outer.setSpacing(0)
-        header = _TitleBar(self.win)
+        header = _TitleBar(self.win, lambda: self._on_drag_end())
         title = QHBoxLayout(header)
         title.setContentsMargins(18, 12, 10, 10)
         title.setSpacing(8)
@@ -275,6 +589,14 @@ class Overlay:
             self._compact = compact
             self._apply_compact(compact)
         self.feed.setFixedHeight(max(100, min(240, int(h * 0.25))))
+        self._elide_chat_name()
+
+    def _elide_chat_name(self):
+        """会话名过长时显示省略号（内部键仍是全名，切换/存储不受影响）。"""
+        if not self._chat:
+            return
+        width = max(60, self.chatBox.width() - 30)
+        self.chatBox.setText(self.chatBox.fontMetrics().elidedText(self._chat, Qt.ElideRight, width))
 
     def _apply_compact(self, compact):
         """紧凑/常规两套间距和可见性；断点没变时不会被调用。"""
@@ -399,19 +721,118 @@ class Overlay:
         self.referenceNote.hide()
         body.addWidget(self.referenceNote)
 
+        actions_row = QHBoxLayout()
         self.historyButton = PushButton(FIF.HISTORY, "聊天记录")
+        self.historyButton.setMinimumWidth(0)
         self.historyButton.clicked.connect(self._toggle_history)
         self.historyButton.setAccessibleName("展开或收起聊天记录")
-        body.addWidget(self.historyButton)
-        self.feed = PlainTextEdit()
-        self.feed.setReadOnly(True)
-        self.feed.setPlaceholderText("识别到的聊天内容会显示在这里")
-        self.feed.setMaximumBlockCount(_LOG_LINES)
-        self.feed.setFixedHeight(160)
-        self.feed.hide()
+        actions_row.addWidget(self.historyButton, 1)
+        self.refreshButton = PushButton(FIF.SYNC, "重新生成")
+        self.refreshButton.setMinimumWidth(0)
+        self.refreshButton.setToolTip("用当前会话已有的聊天记录再生成一轮建议（生成失败或想换个写法时用）")
+        self.refreshButton.setAccessibleName("重新生成回复建议")
+        self.refreshButton.clicked.connect(self._refresh_clicked)
+        actions_row.addWidget(self.refreshButton)
+        body.addLayout(actions_row)
+        self.feed = self._build_feed()
         body.addWidget(self.feed)
         self._history_title()
         body.addStretch(1)
+
+    def _build_feed(self):
+        """聊天记录区：气泡流。对方消息后跟一条灰色「Jev 判断」泡，像微信聊天那样读。
+        滚动条隐藏（首页自己有一根，嵌套出两根很蠢；滚轮照样能滚）。"""
+        scroll = ScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)  # 只留首页一根滚动条
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet(
+            "QScrollArea { background: #fbfcfb; border: 1px solid #e2e7e3; border-radius: 10px; }")
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        self.feedBox = QVBoxLayout(content)
+        self.feedBox.setContentsMargins(10, 10, 10, 10)
+        self.feedBox.setSpacing(6)
+        self.feedBox.addStretch(1)  # 永远在末尾：气泡少的时候全顶到上面
+        scroll.setWidget(content)
+        scroll.setFixedHeight(160)
+        scroll.hide()
+        return scroll
+
+    def _bubble_card(self, bg, border, text, color, size):
+        """一个圆角气泡。QLabel 继承 QFrame，样式选择器必须用 objectName 圈死卡片本身，
+        不然会把泡里每一个文字标签都画上边框和底色。"""
+        card = QFrame()
+        card.setObjectName("bubbleCard")
+        qss = f"QFrame#bubbleCard {{ background: {bg}; border-radius: 10px;"
+        if border:
+            qss += f" border: 1px solid {border};"
+        card.setStyleSheet(qss + " }")
+        inner = QVBoxLayout(card)
+        inner.setContentsMargins(10, 7, 10, 8)
+        inner.setSpacing(3)
+        inner.addWidget(_label(text, size, color))
+        return card
+
+    def _append_bubble(self, entry):
+        """一条记录 → 气泡控件贴进记录区。对方靠左白底、我靠右绿底、Jev 判断靠左灰底带抬头。"""
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        kind = entry["kind"]
+        if kind == "jev":
+            card = QFrame()
+            card.setObjectName("bubbleCard")
+            card.setStyleSheet("QFrame#bubbleCard { background: #ecefee; border-radius: 10px; }")
+            inner = QVBoxLayout(card)
+            inner.setContentsMargins(10, 6, 10, 8)
+            inner.setSpacing(3)
+            inner.addWidget(_label(f"Jev · {entry['ts']}", 10, _MUTED, True))
+            inner.addWidget(_label(entry["text"], 12, "#42574a"))
+            row.addWidget(card, 4)
+            row.addStretch(1)
+        elif kind == "note":
+            note = _label(entry["text"], 11, _MUTED)
+            note.setAlignment(Qt.AlignCenter)
+            row.addStretch(1)
+            row.addWidget(note, 4)
+            row.addStretch(1)
+        else:
+            mine = entry["who"] == "me"
+            who = "我" if mine else (entry["name"] or "对方")
+            head = _label(f"{who} · {entry['ts']}", 10, _MUTED, True)
+            card = QFrame()
+            card.setObjectName("bubbleCard")
+            bg = "#dcf2cd" if mine else "#ffffff"
+            border = "" if mine else "1px solid #e2e7e3"
+            card.setStyleSheet(
+                f"QFrame#bubbleCard {{ background: {bg}; border-radius: 10px; border: {border}; }}")
+            inner = QVBoxLayout(card)
+            inner.setContentsMargins(10, 6, 10, 8)
+            inner.setSpacing(3)
+            inner.addWidget(head)
+            inner.addWidget(_label(entry["text"], 13, "#233c2f"))
+            if mine:
+                row.addStretch(1)
+                row.addWidget(card, 4)
+            else:
+                row.addWidget(card, 4)
+                row.addStretch(1)
+        wrap = QWidget()
+        wrap.setLayout(row)
+        self.feedBox.insertWidget(self.feedBox.count() - 1, wrap)
+        return wrap
+
+    def _clear_feed(self):
+        while self.feedBox.count() > 1:  # 留着末尾那个 stretch
+            item = self.feedBox.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def _scroll_feed_bottom(self):
+        bar = self.feed.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
     def _build_settings(self):
         self.settingsPage, body = self._scroll_page()
@@ -465,10 +886,66 @@ class Overlay:
         self.targetSwitch.setOnText("开")
         self.targetSwitch.setOffText("关")
         self.targetSwitch.setAccessibleName("群聊指定回复对象")
+        # 开关即时保存：拨了就落盘，不用再找「保存设置」（不然拨完关页就丢，看起来像没保存）
+        self.targetSwitch.checkedChanged.connect(self._instant_save)
         target_row.addWidget(self.targetSwitch)
         box.addLayout(target_row)
         box.addWidget(self._hint(
             "开了以后群聊里可以选回复给谁，候选会针对 TA 写，填入时可带 @。关了就正常回复。"
+        ))
+        snap_row = QHBoxLayout()
+        snap_row.addWidget(_label("吸附跟随微信窗口", 13), 1)
+        self.snapSwitch = SwitchButton()
+        self.snapSwitch.setOnText("开")
+        self.snapSwitch.setOffText("关")
+        self.snapSwitch.setAccessibleName("吸附跟随微信窗口")
+        self.snapSwitch.checkedChanged.connect(self._instant_save)
+        snap_row.addWidget(self.snapSwitch)
+        box.addLayout(snap_row)
+        box.addWidget(self._hint(
+            "悬浮窗自动贴在微信窗口旁边（等高、零间隙），微信挪它也跟着挪。"
+            "关了就停在你拖到的地方。"
+        ))
+        bubble_row = QHBoxLayout()
+        bubble_row.addWidget(_label("微信内气泡浮层", 13), 1)
+        self.bubbleSwitch = SwitchButton()
+        self.bubbleSwitch.setOnText("开")
+        self.bubbleSwitch.setOffText("关")
+        self.bubbleSwitch.setAccessibleName("微信内气泡浮层")
+        self.bubbleSwitch.checkedChanged.connect(self._instant_save)
+        bubble_row.addWidget(self.bubbleSwitch)
+        box.addLayout(bubble_row)
+        box.addWidget(self._hint(
+            "把对方最新消息、Jev 判断和三条候选直接画在微信聊天区上，"
+            "点候选气泡即填入。跟着微信同层显示，微信被盖住它也跟着被盖。"
+        ))
+        vision_row = QHBoxLayout()
+        vision_row.addWidget(_label("起草用视觉模型读屏", 13), 1)
+        self.visionSwitch = SwitchButton()
+        self.visionSwitch.setOnText("开")
+        self.visionSwitch.setOffText("关")
+        self.visionSwitch.setAccessibleName("起草用视觉模型读屏")
+        self.visionSwitch.checkedChanged.connect(self._instant_save)
+        vision_row.addWidget(self.visionSwitch)
+        box.addLayout(vision_row)
+        box.addWidget(self._hint(
+            "开了以后起草时把聊天区截图直接发给模型（仅聊天对话区，不含侧边栏），"
+            "图片/表情等文字读不出的内容也能看见。模型就是上面「起草」组里选的那个——"
+            "需要支持图片输入的型号（如 GLM-4V、GPT-4o、Qwen-VL 系列），不支持的会报错，关掉即可；"
+            "会话名识别和触发检测仍用本地 OCR。"
+        ))
+        noise_row = QHBoxLayout()
+        noise_row.addWidget(_label("过滤群聊系统通知", 13), 1)
+        self.noiseSwitch = SwitchButton()
+        self.noiseSwitch.setOnText("开")
+        self.noiseSwitch.setOffText("关")
+        self.noiseSwitch.setAccessibleName("过滤群聊系统通知")
+        self.noiseSwitch.checkedChanged.connect(self._instant_save)
+        noise_row.addWidget(self.noiseSwitch)
+        box.addLayout(noise_row)
+        box.addWidget(self._hint(
+            "进群/退群/撤回/时间戳这类系统通知不是人说的话：开了就在读取时直接滤掉、"
+            "不再混进分析，同时给起草模型注入「忽略系统通知」的提示词兜底。"
         ))
         update_row = QHBoxLayout()
         update_row.addWidget(_label("启动时检查更新", 13), 1)
@@ -476,6 +953,7 @@ class Overlay:
         self.updateSwitch.setOnText("开")
         self.updateSwitch.setOffText("关")
         self.updateSwitch.setAccessibleName("启动时检查更新")
+        self.updateSwitch.checkedChanged.connect(self._instant_save)
         update_row.addWidget(self.updateSwitch)
         box.addLayout(update_row)
         box.addWidget(self._hint(
@@ -503,9 +981,12 @@ class Overlay:
         box.addWidget(_label("模型", 16, "#304c3c", True))
         self._fetched = _Fetched()
         self._fetched.done.connect(self._models_fetched)
+        self._tested = _Tested()
+        self._tested.done.connect(self._test_finished)
         self.jev = self._model_group(box, "判断 · Jev", "jev", providers.JEV_PROVIDERS)
         box.addWidget(self._hint(
-            "判断意图、紧张度，并给三条候选排序。两家给的是同一个 Jev，必填。"
+            "判断意图、紧张度，并给三条候选排序。OpenRouter / TypeSafe 是同一个 Jev；"
+            "「自定义」填同协议（/api/alpha/decisions）的代理或自建地址。"
         ))
         self.draft = self._model_group(box, "起草 · 语言模型", "draft", providers.DRAFT_PROVIDERS)
         box.addWidget(self._hint(
@@ -518,11 +999,65 @@ class Overlay:
         self.thinkingSwitch.setOnText("开")
         self.thinkingSwitch.setOffText("关")
         self.thinkingSwitch.setAccessibleName("起草时开启思考模式")
+        self.thinkingSwitch.checkedChanged.connect(self._instant_save)
         think_row.addWidget(self.thinkingSwitch)
         box.addLayout(think_row)
         box.addWidget(self._hint(
             "关：秒回，够用。开：模型先想再写，更斟酌但慢好几倍、贵一些。"
             "只有 " + " / ".join(providers.THINKING) + " 认这个开关。"
+        ))
+        extra_label = _label("起草高级参数", 13)
+        box.addWidget(extra_label)
+        # 不懂 JSON 也能调：三个常用参数勾选即生效，其余进阶字段才用 JSON
+        param_row = QHBoxLayout()
+        self.tempCheck = CheckBox("温度")
+        param_row.addWidget(self.tempCheck)
+        self.tempSpin = DoubleSpinBox()
+        self.tempSpin.setRange(0.0, 2.0)
+        self.tempSpin.setDecimals(1)
+        self.tempSpin.setSingleStep(0.1)
+        self.tempSpin.setValue(1.2)  # 起草的默认温度就是 1.2（draft.py）
+        self.tempSpin.setEnabled(False)
+        self.tempSpin.setAccessibleName("温度")
+        self.tempCheck.toggled.connect(self.tempSpin.setEnabled)
+        param_row.addWidget(self.tempSpin)
+        param_row.addStretch(1)
+        box.addLayout(param_row)
+        topp_row = QHBoxLayout()
+        self.topPCheck = CheckBox("Top P")
+        topp_row.addWidget(self.topPCheck)
+        self.topPSpin = DoubleSpinBox()
+        self.topPSpin.setRange(0.0, 1.0)
+        self.topPSpin.setDecimals(2)
+        self.topPSpin.setSingleStep(0.05)
+        self.topPSpin.setValue(0.9)
+        self.topPSpin.setEnabled(False)
+        self.topPSpin.setAccessibleName("Top P")
+        self.topPCheck.toggled.connect(self.topPSpin.setEnabled)
+        topp_row.addWidget(self.topPSpin)
+        topp_row.addStretch(1)
+        box.addLayout(topp_row)
+        tok_row = QHBoxLayout()
+        self.maxTokCheck = CheckBox("最大输出 tokens")
+        tok_row.addWidget(self.maxTokCheck)
+        self.maxTokSpin = SpinBox()
+        self.maxTokSpin.setRange(16, 8192)
+        self.maxTokSpin.setSingleStep(16)
+        self.maxTokSpin.setValue(400)
+        self.maxTokSpin.setEnabled(False)
+        self.maxTokSpin.setAccessibleName("最大输出 tokens")
+        self.maxTokCheck.toggled.connect(self.maxTokSpin.setEnabled)
+        tok_row.addWidget(self.maxTokSpin)
+        tok_row.addStretch(1)
+        box.addLayout(tok_row)
+        self.extraEdit = LineEdit()
+        self.extraEdit.setPlaceholderText('其它参数（JSON，可选），例如 {"frequency_penalty": 0.5}')
+        self.extraEdit.setAccessibleName("其它起草参数 JSON")
+        box.addWidget(self.extraEdit)
+        box.addWidget(self._hint(
+            "勾了就生效：温度越高越随性，Top P 越低越稳，tokens 限回复长度。"
+            "「其它参数」是给进阶用户的 JSON，会浅合并进请求体（盖过上面几项），"
+            "OpenAI / Anthropic 协议生效，Gemini 协议忽略。"
         ))
         body.addWidget(models)
         self.settingsFeedback = _label("", 13, _GREEN)
@@ -547,6 +1082,23 @@ class Overlay:
         self._hintLabels.append(label)
         return label
 
+    def _instant_save(self, _on=False):
+        """偏好开关即时落盘：拨了就存，不等「保存设置」——不然拨完关页就丢，
+        看起来就是「设置没保存」。开关一起存，幂等且便宜。
+        装载（回显）期间不存：setChecked 触发的 toggled 带着的是半初始化状态。"""
+        if self._loading:
+            return
+        try:
+            settings.save(reply_target_on=self.targetSwitch.isChecked(),
+                          snap_follow_on=self.snapSwitch.isChecked(),
+                          check_update_on=self.updateSwitch.isChecked(),
+                          thinking_on=self.thinkingSwitch.isChecked(),
+                          bubble_layer_on=self.bubbleSwitch.isChecked(),
+                          filter_system_msgs_on=self.noiseSwitch.isChecked(),
+                          vision_draft_on=self.visionSwitch.isChecked())
+        except Exception:
+            pass  # 存不进去（磁盘只读之类）别把界面搞崩，下次点「保存设置」还能兜住
+
     def _model_group(self, box, title, kind, table):
         """一组「来源 / 密钥 / 模型」控件，判断和起草各一份。table 是 core/providers.py 里那张表。"""
         group = SimpleNamespace(kind=kind, table=table, ids=list(table),
@@ -567,14 +1119,13 @@ class Overlay:
         group.providerBox.setAccessibleName(f"{title} 来源")
         source_label.setBuddy(group.providerBox)
         box.addWidget(group.providerBox)
-        if kind == "draft":  # 只有两个「自定义」来源要自己填地址，别的来源这一行藏着
-            self.baseLabel = _label("Base URL", 13)
-            box.addWidget(self.baseLabel)
-            self.baseEdit = LineEdit()
-            self.baseEdit.setPlaceholderText("https://你的服务/v1")
-            self.baseEdit.setAccessibleName("自定义来源 Base URL")
-            self.baseLabel.setBuddy(self.baseEdit)
-            box.addWidget(self.baseEdit)
+        group.baseLabel = _label("Base URL", 13)
+        box.addWidget(group.baseLabel)
+        group.baseEdit = LineEdit()
+        group.baseEdit.setPlaceholderText("切来源会自动填它的默认地址，可手动改成镜像/代理")
+        group.baseEdit.setAccessibleName(f"{title} Base URL")
+        group.baseLabel.setBuddy(group.baseEdit)
+        box.addWidget(group.baseEdit)
         key_label = _label("密钥", 13)
         box.addWidget(key_label)
         group.keyEdit = PasswordLineEdit()
@@ -583,7 +1134,7 @@ class Overlay:
         group.keyEdit.returnPressed.connect(self._save)
         box.addWidget(group.keyEdit)
         box.addWidget(self._hint(
-            "OpenRouter 的 key 或 TypeSafe 的 key，看上面选的来源。" if kind == "jev"
+            "看上面选的来源：OpenRouter、TypeSafe 或你自定义接口的 key。" if kind == "jev"
             else "上面选哪家就填哪家的 key；换来源重填一次，只存这一把。"))
         model_label = _label("模型", 13)
         box.addWidget(model_label)
@@ -595,9 +1146,16 @@ class Overlay:
         model_label.setBuddy(group.modelBox)
         row.addWidget(group.modelBox, 1)
         group.fetchButton = PushButton("获取模型")
+        group.fetchButton.setMinimumWidth(0)  # 窄窗时允许压缩，别把页面撑出可视区
         group.fetchButton.setAccessibleName(f"获取{title}的可用模型列表")
         group.fetchButton.clicked.connect(lambda: self._fetch_models(group))
         row.addWidget(group.fetchButton)
+        group.testButton = PushButton("测试")
+        group.testButton.setMinimumWidth(0)
+        group.testButton.setToolTip("用当前配置发一次最小请求，验证地址、密钥和模型是否可用")
+        group.testButton.setAccessibleName(f"测试{title}配置")
+        group.testButton.clicked.connect(lambda: self._test_models(group))
+        row.addWidget(group.testButton)
         box.addLayout(row)
         group.status = _label("", 12, _MUTED)
         box.addWidget(group.status)
@@ -609,18 +1167,23 @@ class Overlay:
         return group.ids[max(0, group.providerBox.currentIndex())]
 
     def _provider_changed(self, group):
-        """换来源：模型框回到这家该有的值（存的就是这家才用存的，否则用它的默认），状态清掉。"""
+        """换来源：模型框和 Base URL 行回到这家该有的值（存的就是这家才用存的，否则用它的默认），
+        状态清掉。地址自动填进去，用户仍可手动改（比如把 OpenRouter 换成镜像）。"""
         provider = self._provider_of(group)
         saved = settings.jev_provider() if group.kind == "jev" else settings.draft_provider()
         stored = settings.jev_model() if group.kind == "jev" else settings.draft_model()
+        saved_base = settings.jev_base_url() if group.kind == "jev" else settings.draft_base_url()
         group.modelBox.clear()
         group.modelBox.setText(stored if provider == saved else group.table[provider].default)
+        # 地址：存的值优先，没存（或来源换过）就填该家的默认
+        group.baseEdit.setText(
+            saved_base if (provider == saved and saved_base) else group.table[provider].base)
         group.status.setText("")
         self._sync_model_fields()
 
     def _sync_model_fields(self):
-        """两组共用：密钥已配置/未配置、占位文案、自定义 Base URL 行的显隐，
-        外加紧凑模式下把来源按钮上的文字省略——ComboBox 是 QPushButton，
+        """两组共用：密钥已配置/未配置、占位文案、Base URL 行（常驻：切来源自动填该家默认地址，
+        可手改），外加紧凑模式下把来源按钮上的文字省略——ComboBox 是 QPushButton，
         minimumSizeHint 按整段文字算，不会自动换行/省略，长名字会把设置页撑宽。"""
         for group in (self.jev, self.draft):
             provider = self._provider_of(group)
@@ -629,23 +1192,22 @@ class Overlay:
             group.keyState.setText("已配置" if configured else "未配置")
             group.keyEdit.setPlaceholderText(
                 "已配置，留空保留" if configured else f"输入 {name} API 密钥")
+            group.baseLabel.show()
+            group.baseEdit.show()
             if self._compact:
                 name = group.providerBox.fontMetrics().elidedText(name, Qt.ElideRight, 180)
             group.providerBox.setText(name)
-        custom = self._provider_of(self.draft) in providers.CUSTOM
-        self.baseLabel.setVisible(custom)
-        self.baseEdit.setVisible(custom)
 
     def _fetch_models(self, group):
-        """「获取模型」：拿填的 key（没填就拿存的）去问接口，网络调用丢后台线程。"""
+        """「获取模型」：拿填的 key（没填就拿存的）和 Base URL 行里的地址去问接口，
+        网络调用丢后台线程。"""
         provider = self._provider_of(group)
-        custom = group.kind == "draft" and provider in providers.CUSTOM
-        base = self.baseEdit.text().strip() if custom else None
+        base = group.baseEdit.text().strip() or None
         key = group.keyEdit.text().strip() or group.stored_key()
         if not key:
             group.status.setText("先填密钥")
             return
-        if custom and not base:
+        if provider == "custom" and not base:
             group.status.setText("先填 Base URL")
             return
         group.status.setText("获取中…")
@@ -657,7 +1219,7 @@ class Overlay:
         """后台线程：判断走 jev_client，起草按协议走 llm；失败把原因一起送回主线程。"""
         try:
             if group.kind == "jev":
-                models = jev_client.list_models(provider, key)
+                models = jev_client.list_models(provider, key, base_url=base)
             else:
                 spec = providers.DRAFT_PROVIDERS[provider]
                 models = llm.list_models(spec.protocol, base or spec.base, key)
@@ -682,16 +1244,18 @@ class Overlay:
         group.status.setText(f"共 {len(models)} 个")
 
     def _set_group(self, group, provider, model):
-        """把存下来的来源和模型放回一组控件里；填充不算用户操作，别触发换来源的重置。"""
+        """把存下来的来源和模型放回一组控件里；填充不算用户操作，别触发换来源的重置。
+        密钥直接填入（PasswordLineEdit 自带眼睛图标切换明文），免得每次重输。"""
         group.providerBox.blockSignals(True)
         group.providerBox.setCurrentIndex(group.ids.index(provider))
         group.providerBox.blockSignals(False)
-        group.keyEdit.clear()
+        group.keyEdit.setText(group.stored_key())
         group.modelBox.clear()
         group.modelBox.setText(model)
         group.status.setText("")
 
     def _load_settings(self):
+        self._loading = True  # 回显期间拦住即时保存（见 _instant_save）
         relationship = settings.relationship()
         index = next((i for i, (_, value) in enumerate(_RELATIONSHIPS) if value == relationship),
                      len(_RELATIONSHIPS) - 1)
@@ -703,26 +1267,71 @@ class Overlay:
         self.targetSwitch.setChecked(settings.reply_target())
         self._set_group(self.jev, settings.jev_provider(), settings.jev_model())
         self._set_group(self.draft, settings.draft_provider(), settings.draft_model())
-        self.baseEdit.setText(settings.draft_base_url())
+        # Base URL 行常驻：存过就用存的，没存把该来源的默认地址填进去（和切换来源时的行为一致）
+        self.jev.baseEdit.setText(
+            settings.jev_base_url() or providers.JEV_PROVIDERS[settings.jev_provider()].base)
+        self.draft.baseEdit.setText(
+            settings.draft_base_url() or providers.DRAFT_PROVIDERS[settings.draft_provider()].base)
+        params = settings.draft_extra() or {}
+        self.tempCheck.setChecked("temperature" in params)
+        self.tempSpin.setValue(float(params.get("temperature") or 1.2))
+        self.tempSpin.setEnabled(self.tempCheck.isChecked())
+        self.topPCheck.setChecked("top_p" in params)
+        self.topPSpin.setValue(float(params.get("top_p") or 0.9))
+        self.topPSpin.setEnabled(self.topPCheck.isChecked())
+        self.maxTokCheck.setChecked("max_tokens" in params)
+        self.maxTokSpin.setValue(int(params.get("max_tokens") or 400))
+        self.maxTokSpin.setEnabled(self.maxTokCheck.isChecked())
+        rest = {k: v for k, v in params.items()
+                if k not in ("temperature", "top_p", "max_tokens")}
+        self.extraEdit.setText(json.dumps(rest, ensure_ascii=False) if rest else "")
         self.thinkingSwitch.setChecked(settings.thinking())
         self.updateSwitch.setChecked(settings.check_update())
+        self.snapSwitch.setChecked(settings.snap_follow())
+        self.bubbleSwitch.setChecked(settings.bubble_layer())
+        self.noiseSwitch.setChecked(settings.filter_system_msgs())
+        self.visionSwitch.setChecked(settings.vision_draft())
         self.set_debug_switch(settings.debug_view())  # 屏蔽信号地拨，别在加载时开关一遍窗口
         self._sync_model_fields()  # 上面屏蔽了信号，这里补一次
         self.settingsFeedback.hide()
+        self._loading = False
 
     def _save(self):
         relationship = _RELATIONSHIPS[self.relationshipBox.currentIndex()][1]
         relationship = relationship or self.relEdit.text().strip()
         jev_provider = self._provider_of(self.jev)
         draft_provider = self._provider_of(self.draft)
-        base = self.baseEdit.text().strip()
+        jev_base = self.jev.baseEdit.text().strip()
+        draft_base = self.draft.baseEdit.text().strip()
+        extra_text = self.extraEdit.text().strip()
+        params = {}
+        if self.tempCheck.isChecked():  # 勾选即生效，没勾用起草默认
+            params["temperature"] = round(self.tempSpin.value(), 2)
+        if self.topPCheck.isChecked():
+            params["top_p"] = round(self.topPSpin.value(), 2)
+        if self.maxTokCheck.isChecked():
+            params["max_tokens"] = self.maxTokSpin.value()
+        if extra_text:  # 「其它参数」进阶 JSON，可选项；非法拦截
+            try:
+                parsed_extra = json.loads(extra_text)
+                assert isinstance(parsed_extra, dict) and parsed_extra
+            except (ValueError, AssertionError):
+                self._settings_feedback('「其它参数」得是 JSON 对象，例如 {"frequency_penalty": 0.5}。', error=True)
+                self.extraEdit.setFocus()
+                return
+            params.update(parsed_extra)
+        extra_text = json.dumps(params, ensure_ascii=False) if params else ""
         if not relationship:
             self._settings_feedback("请填写关系背景，或选择一个已有选项。", error=True)
             self.relEdit.setFocus()
             return
-        if draft_provider in providers.CUSTOM and not base:
+        if draft_provider in providers.CUSTOM and not draft_base:
             self._settings_feedback("自定义来源要填 Base URL。", error=True)
-            self.baseEdit.setFocus()
+            self.draft.baseEdit.setFocus()
+            return
+        if jev_provider == "custom" and not jev_base:
+            self._settings_feedback("自定义判断来源要填 Base URL。", error=True)
+            self.jev.baseEdit.setFocus()
             return
         for group, provider in ((self.jev, jev_provider), (self.draft, draft_provider)):
             name = group.table[provider].name
@@ -739,18 +1348,23 @@ class Overlay:
                           jev_provider_text=jev_provider,
                           jev_key_text=self.jev.keyEdit.text().strip() or None,
                           jev_model_text=self.jev.modelBox.text().strip(),
+                          jev_base_url_text=jev_base,
                           draft_provider_text=draft_provider,
                           llm_key_text=self.draft.keyEdit.text().strip() or None,
                           draft_model_text=self.draft.modelBox.text().strip(),
-                          draft_base_url_text=base,
+                          draft_base_url_text=draft_base,
+                          draft_extra_text=extra_text,
                           reply_target_on=self.targetSwitch.isChecked(),
                           style_text=self.styleEdit.text().strip(),
                           thinking_on=self.thinkingSwitch.isChecked(),
-                          check_update_on=self.updateSwitch.isChecked())
+                          check_update_on=self.updateSwitch.isChecked(),
+                          snap_follow_on=self.snapSwitch.isChecked())
         except Exception:
             self._settings_feedback("保存失败，请检查配置文件是否可写后重试。", error=True)
             return
         self._load_settings()
+        self._pinned = False  # 重新保存过设置，吸附跟随立刻恢复
+        self._pin_rect = None
         self._render_targets()  # 开关刚改过，回到首页时这一行该显该藏得重算一次
         self._settings_feedback("设置已保存，将用于下一次回复。")
         self.setupButton.hide()
@@ -785,8 +1399,6 @@ class Overlay:
         (self.relationshipBox if settings.has_key() else self.jev.keyEdit).setFocus()
 
     def _back_home(self):
-        self.jev.keyEdit.clear()
-        self.draft.keyEdit.clear()
         self.pages.setCurrentWidget(self.home)
         self.settingsButton.setEnabled(True)
 
@@ -809,6 +1421,164 @@ class Overlay:
             return
         self.app.clipboard().setText(self.cands[index])
         self.set_status("回复已复制，可在微信中粘贴并修改。", "success")
+
+    def snap_to(self, rect):
+        """微信窗口矩形（Win32 GetWindowRect 的**物理像素**）→ 悬浮窗完全贴边吸附：
+        高度与微信窗口一致、顶边对齐、0 间距；微信宽 + 悬浮窗宽超出屏幕时自动收窄悬浮窗
+        （最小 320），选剩余空间更宽的一边贴外缘；两侧都放不下才内叠（靠左缘，盖会话列表
+        不盖聊天内容）。Qt 的 move() 吃逻辑坐标，高 DPI 下先按 devicePixelRatio 换算。
+        用户拖走（_pinned）后停在原地，但微信窗口一动就恢复跟随。"""
+        self._last_rect = rect  # 拖拽松手时算磁吸要用最新的微信矩形
+        if not settings.snap_follow() or self.win.isMinimized():
+            return
+        if QApplication.mouseButtons() & Qt.LeftButton:  # 拖动中，别抢
+            return
+        if self._pinned:
+            # 拖走后停在原地；微信矩形一变（挪了/缩放了）就当用户想让它继续跟
+            if self._pin_rect is None:
+                self._pin_rect = rect
+                return
+            if rect != self._pin_rect:
+                self._pinned = False
+                self._pin_rect = None
+            else:
+                return
+        target = self._dock_target(rect)
+        if target is None:
+            return
+        x, y, new_w, new_h = target
+        if (self.win.width(), self.win.height()) != (new_w, new_h):
+            self.win.resize(new_w, new_h)
+        if (x, y) != (self.win.x(), self.win.y()):
+            self.win.move(x, y)
+
+    def _on_drag_end(self):
+        """拖悬浮窗松手：离贴边位 60 逻辑像素内当手滑，磁吸回贴边位；拖得远才算手动摆放
+        （钉住，微信一动恢复跟随）。"""
+        rect = self._last_rect
+        if not settings.snap_follow() or rect is None:
+            self._pinned = True  # 没有微信矩形可参照（没开微信/关了跟随），按手动摆放算
+            self._pin_rect = None
+            return
+        target = self._dock_target(rect)
+        if target is None:
+            self._pinned = True
+            self._pin_rect = rect
+            return
+        x, y, new_w, new_h = target
+        near = ((self.win.x() - x) ** 2 + (self.win.y() - y) ** 2) ** 0.5 <= 60
+        if near:
+            self._pinned = False
+            self._pin_rect = None
+            if (self.win.width(), self.win.height()) != (new_w, new_h):
+                self.win.resize(new_w, new_h)
+            self.win.move(x, y)
+        else:
+            self._pinned = True
+            self._pin_rect = rect
+
+    def _border_offsets(self):
+        """悬浮窗自己的不可见边框（物理 px）：Win32 矩形和 Qt 逻辑几何的差。
+        Qt 的无框窗口在 Win32 里仍留着缩放边，不补偿的话贴边永远差几个像素。缓存一次。"""
+        if self._border is None:
+            try:
+                dpr = self.win.screen().devicePixelRatio() or 1.0
+                g = ctypes.wintypes.RECT()
+                ctypes.windll.user32.GetWindowRect(int(self.win.winId()), ctypes.byref(g))
+                ql = round(self.win.x() * dpr)
+                qt = round(self.win.y() * dpr)
+                qr = round((self.win.x() + self.win.width()) * dpr)
+                qb = round((self.win.y() + self.win.height()) * dpr)
+                self._border = (g.left - ql, g.top - qt, g.right - qr, g.bottom - qb)
+            except Exception:
+                self._border = (0, 0, 0, 0)
+        return self._border
+
+    def _dock_target(self, rect):
+        """给定微信**可见边界**矩形（Win32 物理像素），算贴边吸附的落点和尺寸
+        (x, y, w, h)（逻辑坐标）；矩形无效返回 None。纯计算不动窗口，吸附和拖拽磁吸共用。
+        全程物理像素计算，最后再除回逻辑：悬浮窗自己的不可见边框（_border_offsets）
+        一并补偿——可见边缘贴可见边缘，才是用户眼里的「完全贴边、高度一致」。"""
+        dpr = self.win.screen().devicePixelRatio() or 1.0
+        left, top, right, bottom = rect
+        screen = self.win.screen().availableGeometry()
+        sl, st = round(screen.left() * dpr), round(screen.top() * dpr)
+        sr = round((screen.right() + 1) * dpr)  # 右/下边界是「第一个不存在的像素」
+        sb = round((screen.bottom() + 1) * dpr)
+        # 矩形出了屏幕（最小化的窗口在 -16000 这类地方、或显示器换了）就没法贴
+        if right <= left or bottom <= top or right < sl or left > sr:
+            return None
+        bl, bt, br, bb = self._border_offsets()
+        # 高度跟微信可见高一致（含自身上下不可见边），不小于最小高、不超出屏幕
+        h = max(round(self.win.minimumHeight() * dpr), min(bottom - top + bt + bb, sb - st))
+        # 宽度：微信可见宽 + 悬浮窗可见宽不许溢出屏幕 → 收窄到贴的那边剩的空间（最小 320 逻辑）
+        free_r = sr - right
+        free_l = left - sl
+        dock_right = free_r >= free_l  # 哪边剩的空间多贴哪边
+        avail = free_r if dock_right else free_l
+        w = round(self.win.width() * dpr)
+        min_w = round(max(320, self.win.minimumWidth()) * dpr)
+        if avail < w:
+            w = max(min_w, min(w, avail))
+        if dock_right:  # 可见左缘贴微信可见右缘：Qt 左 = 微信右 + 自身左边框
+            x = min(right + bl, sr - w)
+        else:  # 可见右缘贴微信可见左缘：Qt 右 = 微信左 - 自身右边框
+            x = max(sl, left - w + br)
+        y = min(top + bt, sb - h)  # 可见顶缘与微信对齐
+        x = max(sl, min(sr - w, x))  # 兜底：不许落屏幕外
+        y = max(st, y)
+        return x / dpr, y / dpr, w / dpr, h / dpr
+
+    def set_bubble_error(self, chat, reason):
+        """记录某会话的生成失败原因：浮层面板显示它（而不是留着一轮旧建议误导人）。"""
+        self._bubble_errors[chat] = reason.strip()[:200]
+
+    def sync_bubble(self, chat, area):
+        """微信聊天区气泡浮层：把当前微信会话的对方消息、Jev 判断、三条候选画到消息区上。
+        chat/area 为空、没结果或开关关 → 隐藏。main 每 250ms 调一次（位置跟微信走）。"""
+        on = settings.bubble_layer() and bool(chat) and bool(area)
+        result = self.result_of(chat) if (on and self.result_of) else None
+        err = self._bubble_errors.get(chat)
+        if not on or (not result and not err):
+            if self._bubble is not None and self._bubble.isVisible():
+                self._bubble.hide()
+            return
+        if self._bubble is None:
+            self._bubble = _BubbleLayer(self)
+        if result is None:  # 生成失败：面板显示原因 + 重试提示（新结果到达时自动清掉）
+            key = ("err", chat, err)
+            if key != self._bubble_key:
+                self._bubble_key = key
+                self._bubble_result = None
+                self._bubble.place(area)
+                self._bubble.set_content(
+                    self.hers.get(chat) or "",  # 原文留着，失败也知道自己在回什么
+                    ["生成失败：" + err, "点「↻ 重新生成」可重试"],
+                    {"candidates": []})
+            else:
+                self._bubble.place(area)
+            return
+        self._bubble_errors.pop(chat, None)  # 成功了就清掉错误态
+        self._bubble.place(area)
+        key = (chat, result.get("seq") or id(result))
+        if key != self._bubble_key:
+            self._bubble_key = key
+            self._bubble_result = result
+            self._bubble.set_content(self.hers.get(chat) or "",
+                                     judgment_lines(result), result)
+
+    def bubble_hwnd(self):
+        """浮层的 Win32 句柄（没建或没显示返回 0）：main 拿它把浮层钉在微信正上方。"""
+        if self._bubble is not None and self._bubble.isVisible():
+            return int(self._bubble.winId())
+        return 0
+
+    def save_bubble_offset(self, dx, dy):
+        """浮层拖拽松手：把相对默认锚点的偏移写进配置（重启后固定在最后位置）。"""
+        try:
+            settings.save(bubble_offset_pair=[int(dx), int(dy)])
+        except Exception:
+            pass
 
     def _capture_toggled(self, on):
         """用户自己拨的开关：界面先改，再通知父进程去开/停采集。"""
@@ -849,6 +1619,8 @@ class Overlay:
 
     def set_busy(self, busy):
         self._busy = busy
+        if self._bubble is not None:  # 浮层上的重新生成按钮跟着转动画
+            self._bubble.set_generating(busy)
         self.progress.setVisible(busy)
         if busy:
             self.invalidate_replies()
@@ -894,6 +1666,55 @@ class Overlay:
             self.emptyHint.setText("请按上方提示处理。收到新的对方消息后会再次尝试。")
             self.setupButton.setVisible(not settings.has_key())
 
+    def _refresh_clicked(self):
+        """首页「重新生成」：忙时提示，闲了交给 main 用当前会话记录再跑一轮。"""
+        if self._busy:
+            self.set_status("正在生成中，稍等一下再试", "warning")
+            return
+        if self.on_refresh:
+            self.on_refresh()
+
+    def _test_models(self, group):
+        """「测试」：用当前配置发一次最小请求，验证地址、密钥、模型是否真的能用。
+        起草发一轮 10 tokens 的小对话；判断拉一次模型列表（decisions 接口没有更便宜的探测）。"""
+        provider = self._provider_of(group)
+        base = group.baseEdit.text().strip() or None
+        key = group.keyEdit.text().strip() or group.stored_key()
+        model = group.modelBox.text().strip() or None
+        if not key:
+            group.status.setText("测试：先填密钥")
+            return
+        if provider in providers.CUSTOM and not base:
+            group.status.setText("测试：先填 Base URL")
+            return
+        group.status.setText("测试中…")
+        group.testButton.setEnabled(False)
+        threading.Thread(target=lambda: self._run_test(group, provider, key, base, model),
+                         daemon=True).start()
+
+    def _run_test(self, group, provider, key, base, model):
+        try:
+            if group.kind == "jev":
+                models = jev_client.list_models(provider, key, base_url=base)
+                ok, msg = bool(models), f"✓ 连通正常，{len(models)} 个模型"
+            else:
+                spec = providers.DRAFT_PROVIDERS[provider]
+                reply = llm.chat(spec.protocol, base or spec.base, key,
+                                 model or spec.default, "你是连通性测试。", ["只回复：正常"],
+                                 temperature=0, max_tokens=10, timeout=20)
+                ok = bool(reply and reply.strip())
+                msg = f"✓ 连通正常（回复：{reply.strip()[:20]}）" if ok else "✗ 模型返回为空"
+        except Exception as exc:
+            ok, msg = False, "✗ " + str(exc)[:100]
+        self._tested.done.emit(group, ok, msg)
+
+    def _test_finished(self, group, ok, msg):
+        group.testButton.setEnabled(True)
+        group.status.setText(msg)
+        from PySide6.QtGui import QColor as _C
+        qss = ("BodyLabel { color: " + (_GREEN if ok else "#b44832") + "; background: transparent; }")
+        setCustomStyleSheet(group.status, qss, qss)
+
     def _toggle_history(self):
         self.feed.setVisible(self.feed.isHidden())
         self._history_title()
@@ -904,31 +1725,45 @@ class Overlay:
         self.historyButton.setText(f"{action}聊天记录" + (f" · {count}" if count else ""))
 
     def log(self, line):
-        """采集状态行：只进正在看的那个会话，不按会话存。"""
-        bar = self.feed.verticalScrollBar()
-        follow = self.feed.isHidden() or bar.value() >= bar.maximum() - 4
-        self.feed.appendPlainText(line)
-        if follow:
-            bar.setValue(bar.maximum())
+        """采集状态行：只贴到正在看的那个会话的记录区（居中小字），不按会话存。"""
+        if self.feed.isHidden():
+            return
+        wrap = self._append_bubble({"kind": "note", "text": line})
+        wrap.setMaximumHeight(24)
+        self._scroll_feed_bottom()
 
     def log_message(self, who, text, name="", timestamp=None, chat=None):
-        """按会话存一份；只有正在看的那个会往显示区里写。"""
+        """按会话存一份；只有正在看的那个会往显示区里写。
+        开了「过滤系统通知」时，漏网的系统通知不更新「对方最近说」——浮层显示的
+        永远是过滤后的最新真人消息原文。"""
         chat = chat or self._shown
-        speaker = (name or "对方") if who == "her" else "我"
         timestamp = timestamp or datetime.now().strftime("%H:%M")
         self.counts[chat] = self.counts.get(chat, 0) + 1
-        lines = self.feeds.setdefault(chat, [])
-        lines.append(f"{timestamp}  {speaker}\n{text}\n")
-        del lines[:-_LOG_LINES]
-        if who == "her":
+        entries = self.feeds.setdefault(chat, [])
+        entries.append({"kind": "msg", "who": who, "name": name, "text": text, "ts": timestamp})
+        del entries[:-_LOG_LINES]
+        noise = who == "her" and settings.filter_system_msgs() and is_system_noise(text)
+        if who == "her" and not noise:
             self.hers[chat] = text
         self._add_chat(chat)
         if chat != self._shown:
             return
-        self.log(lines[-1])
-        if who == "her":
+        self._append_bubble(entries[-1])
+        self._scroll_feed_bottom()
+        if who == "her" and not noise:
             self._show_latest(text)
         self._history_title()
+
+    def show_judgment(self, chat, text):
+        """一轮分析完成：判断摘要当「Jev 气泡」存进那个会话的记录（跟在对方消息后面）。"""
+        entry = {"kind": "jev", "text": text, "ts": datetime.now().strftime("%H:%M")}
+        entries = self.feeds.setdefault(chat, [])
+        entries.append(entry)
+        del entries[:-_LOG_LINES]
+        self._add_chat(chat)
+        if chat == self._shown:
+            self._append_bubble(entry)
+            self._scroll_feed_bottom()
 
     def _show_latest(self, text):
         self.latest.setText(text if len(text) <= 120 else text[:120] + "…")
@@ -970,9 +1805,10 @@ class Overlay:
     def _switch_to(self, title):
         """换正在看的会话：记录、对方最近说、条数、上次的建议一起换过去。"""
         self._shown = title
-        self.feed.clear()
-        for line in self.feeds.get(title, []):
-            self.feed.appendPlainText(line)
+        self._clear_feed()
+        for entry in self.feeds.get(title, []):
+            self._append_bubble(entry)
+        self._scroll_feed_bottom()
         her = self.hers.get(title)
         if her:
             self._show_latest(her)
@@ -981,6 +1817,7 @@ class Overlay:
         self._history_title()
         self._follow_text()
         self._render_targets()
+        self._elide_chat_name()
         self.show_cached(self.result_of(title) if self.result_of else None)
 
     def set_targets(self, chat, senders, current):
