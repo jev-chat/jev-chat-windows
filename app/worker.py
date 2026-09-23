@@ -30,7 +30,7 @@ def _packet(full, area, title, reader, lines):
             "ocr_ms": reader.last_ms if reader else 0, "ts": time.time()}
 
 
-def run(q, hwnd, enabled, debug_on):
+def run(q, hwnd, enabled, debug_on, chat_app="wechat"):
     """enabled 置位=采集，清掉=暂停。暂停时停掉 WGC 会话（Windows 那圈黄色采集边框也跟着没了），
     恢复时重开一个；readers 一直留着，去重状态不丢，恢复后不会把屏幕上的旧消息再报一遍。
     debug_on 置位才往队列里送整帧（一帧 2~3MB），关着一点额外活都不干。"""
@@ -50,7 +50,7 @@ def run(q, hwnd, enabled, debug_on):
             continue
         if cap is None:
             try:
-                cap = Capture(hwnd)
+                cap = Capture(hwnd, chat_app)
             except Exception as e:
                 q.put(("dead", "无法开始采集：" + (" ".join(str(e).split())[:120] or type(e).__name__)))
                 enabled.clear()  # 自己清掉，下一圈就去等着，别一秒重试几十次
@@ -63,7 +63,7 @@ def run(q, hwnd, enabled, debug_on):
             full = cap.settled()
             if full is not None:
                 reader, lines = None, []  # 调试视图要用，消息区没认出来时就是空的
-                area = chat_area(full)  # 每次停稳都重算：拖完窗口微信布局会晚一拍才铺好，只按尺寸变化算一次会锁死
+                area = chat_area(full, chat_app)  # 每次停稳都重算，适配微信/QQ拖动后的布局
                 if area is None:
                     if not warned:
                         q.put(("status", "消息区认不出来（窗口太小？）"))
@@ -88,7 +88,7 @@ def run(q, hwnd, enabled, debug_on):
                             title = name
                             q.put(("chat", title))
                     reader = readers.setdefault(title, Reader())
-                    lines = reader.read(full[y0:y1, x0:x1], bg)
+                    lines = reader.read(full[y0:y1, x0:x1], bg, chat_app)
                     new = reader.new_lines(lines)
                     if new:
                         q.put(("lines", title, new, rect))

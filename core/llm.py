@@ -26,7 +26,8 @@ def _turns(user_turns: list[str], assistant: str = "assistant") -> list[dict]:
 
 def chat(protocol: str, base_url: str | None, api_key: str, model: str, system: str,
          user_turns: list[str], *, temperature: float = 1.0, max_tokens: int = 400,
-         thinking: bool = False, extra_body: dict | None = None, timeout: float = 30) -> str:
+         thinking: bool = False, extra_body: dict | None = None,
+         response_format: dict | None = None, timeout: float = 30) -> str:
     """发一轮对话，返回模型输出的纯文本。
 
     user_turns: 用户/助手交替的文本，奇数条，首尾都是用户说的（追问补齐候选就是 3 条）。
@@ -40,11 +41,11 @@ def chat(protocol: str, base_url: str | None, api_key: str, model: str, system: 
         return _gemini(base_url, api_key, model, system, user_turns,
                        temperature, max_tokens, thinking, timeout)
     return _openai(base_url, api_key, model, system, user_turns,
-                   temperature, max_tokens, extra_body, timeout)
+                   temperature, max_tokens, extra_body, response_format, timeout)
 
 
 def _openai(base_url, api_key, model, system, user_turns, temperature, max_tokens,
-            extra_body, timeout) -> str:
+            extra_body, response_format, timeout) -> str:
     import openai
 
     try:
@@ -55,7 +56,8 @@ def _openai(base_url, api_key, model, system, user_turns, temperature, max_token
             messages=[{"role": "system", "content": system}] + _turns(user_turns),
             temperature=temperature, max_tokens=max_tokens,
             stream=False,  # DeepSeek 要显式关；别家无所谓
-            **({"extra_body": extra_body} if extra_body else {}))
+            **({"extra_body": extra_body} if extra_body else {}),
+            **({"response_format": response_format} if response_format else {}))
     except Exception as exc:
         _fail(exc, "起草")
     return resp.choices[0].message.content or ""

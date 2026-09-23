@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """找微信窗口 + Windows Graphics Capture 盯着它 + 从帧里定位消息区。帧全程内存，绝不落盘。"""
 import ctypes
+import ctypes.wintypes
 import os
 import time
 
@@ -9,9 +10,13 @@ import numpy as np
 u32 = ctypes.windll.user32
 
 
-def find_wechat_hwnd():
-    """枚举可见顶层窗口，进程是 Weixin.exe/WeChat.exe 的里挑标题「微信」的（主窗口），没有就取第一个。
-    同进程还有 'Weixin'（工具窗）、'图片和视频'（看图窗）等，面积可能更大，所以不能按面积挑。"""
+def find_chat_hwnd(app="wechat"):
+    """枚举目标聊天软件的可见顶层窗口，优先选主窗口而不是工具窗。"""
+    profiles = {
+        "wechat": (("weixin.exe", "wechat.exe"), ("微信",), "Weixin.exe / WeChat.exe"),
+        "qq": (("qq.exe",), ("QQ",), "QQ.exe"),
+    }
+    exes, titles, display = profiles.get(app, profiles["wechat"])
     k32 = ctypes.windll.kernel32
     found = []
 
@@ -30,16 +35,28 @@ def find_wechat_hwnd():
             return True
         pid = ctypes.c_ulong()
         u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if exe_of(pid.value) in ("weixin.exe", "wechat.exe"):
+        if exe_of(pid.value) in exes:
             title = ctypes.create_unicode_buffer(256)
             u32.GetWindowTextW(hwnd, title, 256)
-            found.append((hwnd, title.value))
+            rect = ctypes.wintypes.RECT()
+            u32.GetWindowRect(hwnd, ctypes.byref(rect))
+            area = max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
+            found.append((hwnd, title.value, area))
         return True
 
     u32.EnumWindows(cb, 0)
     if not found:
-        raise RuntimeError("没找到 Weixin.exe / WeChat.exe 的可见窗口，微信开着吗？")
-    return next((h for h, t in found if t == "微信"), found[0][0])
+        raise RuntimeError(f"没找到 {display} 的可见窗口，聊天软件开着吗？")
+    exact = next((item for item in found if item[1] in titles), None)
+    if exact:
+        return exact[0]
+    named = [item for item in found if item[1].strip()]
+    return max(named or found, key=lambda item: item[2])[0]
+
+
+def find_wechat_hwnd():
+    """旧调用兼容。"""
+    return find_chat_hwnd("wechat")
 
 
 def unminimize(hwnd):
@@ -52,7 +69,7 @@ def unminimize(hwnd):
     return True
 
 
-def chat_area(full, header_h=60):
+def chat_area(full, app="wechat", header_h=None):
     """消息列表区 (x0, y_top, x1, y_in, 面板底色, y_pane)，全靠像素锚点，不写死坐标，深浅主题通用：
     - 面板底色 = 右半边最常见的颜色（抽样算，全量 np.unique 在 2560 宽的图上要半秒）
     - 面板左/右边界 = 第一/最后一根「底色占比 > 30%」的列（联系人列表是另一种底色，占比 0）
@@ -61,6 +78,8 @@ def chat_area(full, header_h=60):
       公告条下面那根（有的话）= 消息区顶 y_top，没有就用 header_h
     认不出（窗口太小 / 拖到一半布局没铺好）返回 None。
     ponytail: 输入框拉高超过面板一半会认错；header_h 按 100% DPI 给的，缩放了按比例调。"""
+    if header_h is None:
+        header_h = 76 if app == "qq" else 60
     H, W = full.shape[:2]
     right = full[::8, W // 2::8].reshape(-1, 3)
     vals, cnt = np.unique(right, axis=0, return_counts=True)
@@ -88,10 +107,10 @@ class Capture:
     """WGC 盯窗口。采集线程只做「跟上一帧比」；settled() 在画面停稳后交出整帧，中间帧（滚动动画、
     新消息滑入的半截气泡）全跳过。动图表情永远停不稳，所以最多等 max_wait 秒照样交。"""
 
-    def __init__(self, hwnd, settle=0.25, max_wait=1.0):
+    def __init__(self, hwnd, app="wechat", settle=0.25, max_wait=1.0):
         from windows_capture import WindowsCapture
 
-        self.settle, self.max_wait = settle, max_wait
+        self.settle, self.max_wait, self.app = settle, max_wait, app
         self.shape = self.area = self.last = self.pending = None
         self.t = self.t0 = 0.0
         cap = WindowsCapture(window_hwnd=hwnd)  # cursor_capture/draw_border 留默认，老版 Win10 不支持切换会抛异常
@@ -104,7 +123,7 @@ class Capture:
         if full.max() == 0:
             return
         if self.area is None or full.shape != self.shape:
-            self.shape, self.area = full.shape, chat_area(full)
+            self.shape, self.area = full.shape, chat_area(full, self.app)
         if self.area is None:
             return
         x0, y0, x1, y1 = self.area[:4]  # 拿上一次的消息区做 diff 就够了，光标闪烁在输入框里，不算变化

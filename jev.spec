@@ -11,10 +11,11 @@ hiddenimports = [
     # 父进程这边 engine 也是运行时才走到，一并钉死，别指望静态分析都能扫出来
     "app.worker", "app.capture", "app.ocr", "app.fill", "app.overlay", "app.settings",
     "app.version", "app.update", "app.debugwin",  # debugwin 是开了调试视图才 import 的
-    "core.engine", "core.draft", "core.jev_client", "core.questions", "core.providers",
+    "core.engine", "core.draft", "core.jev_client", "core.questions", "core.providers", "core.reply_rules", "core.history",
     "core.llm",
 ]
 datas, binaries = [], []
+datas.append(("rules", "rules"))
 for pkg in (
     "rapidocr_onnxruntime",  # .onnx 模型 + config.yaml 是包数据，不收就是启动即炸
     "onnxruntime",           # capi 下面那堆 DLL
@@ -54,7 +55,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=["tools/pyi_qt_path.py"],
     excludes=excludes,
     noarchive=False,
 )

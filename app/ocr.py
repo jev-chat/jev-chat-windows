@@ -33,7 +33,7 @@ def read_title(header):
     return re.sub(r"\s*[（(]\d+[)）]\s*$", "", text.strip())
 
 
-def who_said(chat, box):
+def who_said(chat, box, app="wechat"):
     """按 OCR 框里的颜色分类，不看 x 坐标。返回 (谁, 底色, 墨高)：
     先看底色平不平：框里众数颜色占比 <45% 就是图片（头像/照片/表情包）里的字 → None 丢掉。
     绿底 → me；非绿且文字对底色对比度 ≥150 → her；其余（引用块、群里的发言人名、时间戳、系统提示、
@@ -56,6 +56,12 @@ def who_said(chat, box):
     for r in (diff > 60).any(axis=1):
         best = best + 1 if r else 0
         ink_h = max(ink_h, best)
+    if app == "qq":
+        # QQ 的自己气泡通常是浅蓝色，主题和版本差异较大；左右位置是更稳定的信号。
+        center_x = (min(xs) + max(xs)) / 2
+        if diff.max() < 150:
+            return "gray", bg, ink_h
+        return ("me" if center_x > 0.55 * chat.shape[1] else "her"), bg, ink_h
     if bg[1] > bg[0] + 40 and bg[1] > bg[2] + 40:
         return "me", bg, ink_h
     return ("her" if diff.max() >= 150 else "gray"), bg, ink_h
@@ -78,7 +84,7 @@ class Reader:
         self.last_boxes = []  # 调试视图用：[(x0,y0,x1,y1,kind,text)]，消息区裁剪坐标
         self.last_ms = 0  # 上一帧 OCR 耗时
 
-    def read(self, chat, pane_bg):
+    def read(self, chat, pane_bg, app="wechat"):
         """→ [(who, name, text, y)]，同一气泡的多行已合并。who ∈ me/her；name 群聊里是发言人，单聊 None。
         顺带把每个框的分类记进 self.last_boxes（调试视图画框用，几十个 tuple，不开也不亏）。"""
         t0 = time.perf_counter()
@@ -91,7 +97,7 @@ class Reader:
         # ponytail: 名字行被 OCR 漏掉时会挂到上一个人头上。
         name, raw = None, []
         for box, text, _ in sorted(res or [], key=lambda r: r[0][0][1]):
-            kind, bg, h = who_said(chat, box)
+            kind, bg, h = who_said(chat, box, app)
             xs, ys = [p[0] for p in box], [p[1] for p in box]
             rect = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
             if kind == "gray":

@@ -8,8 +8,8 @@ from types import SimpleNamespace
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QSizeGrip, QSizePolicy, QStackedWidget,
-    QVBoxLayout, QWidget,
+    QApplication, QAbstractItemView, QFrame, QHBoxLayout, QListWidget, QListWidgetItem,
+    QMessageBox, QSizeGrip, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
     BodyLabel, CardWidget, CheckBox, ComboBox, EditableComboBox, FluentIcon as FIF,
@@ -27,7 +27,9 @@ _LOG_LINES = 300
 _MUTED = "#68776f"
 _GREEN = "#18794e"
 _RELATIONSHIPS = [
-    ("恋人", "romantic partners"), ("朋友", "friends"), ("同事", "colleagues"),
+    ("女友 / 恋人", "romantic partners"), ("追求对象", "romantic interest"),
+    ("暧昧对象", "ambiguous romantic interest"), ("朋友", "friends"),
+    ("同事", "colleagues"),
     ("家人", "family"), ("自定义", None),
 ]
 
@@ -133,8 +135,9 @@ class _ReplyCard(_Surface):
         box.addWidget(self.text)
         bottom = QHBoxLayout()
         bottom.addStretch(1)
-        self.fillButton = (PrimaryPushButton if recommended else PushButton)("填入微信", self)
-        self.fillButton.setAccessibleName(f"填入{'推荐回复' if recommended else f'备选 {number}'}到微信")
+        self.fillButton = (PrimaryPushButton if recommended else PushButton)("填入当前对话", self)
+        self.fillButton.setAccessibleName(
+            f"填入{'推荐回复' if recommended else f'备选 {number}'}到当前对话")
         self.fillButton.clicked.connect(lambda: owner._fill(index))
         bottom.addWidget(self.fillButton)
         box.addLayout(bottom)
@@ -151,7 +154,8 @@ class _ReplyCard(_Surface):
 
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
-                 on_toggle_debug=None):
+                 on_toggle_debug=None, on_settings_saved=None, on_retry=None,
+                 on_history_generate=None, on_settings_reset=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。"""
@@ -162,6 +166,10 @@ class Overlay:
         self.on_toggle_capture = on_toggle_capture
         self.on_target_change = on_target_change
         self.on_toggle_debug = on_toggle_debug
+        self.on_settings_saved = on_settings_saved
+        self.on_retry = on_retry
+        self.on_history_generate = on_history_generate
+        self.on_settings_reset = on_settings_reset
         self.result_of = result_of
         self.cands = []
         self.cards = []
@@ -170,15 +178,17 @@ class Overlay:
         self._compact = None  # 断点模式：None 保证 _relayout 第一次调用必定生效
         self._pageLayouts = []
         self._hintLabels = []
-        self.feeds = {}  # {会话名: [排好版的记录]}
+        self.feeds = {}  # {会话名: [消息记录 dict]}
         self.counts = {}  # {会话名: 消息条数}
         self.hers = {}  # {会话名: 对方最近一句}
         self.targets = {}  # {会话名: ([发言人], 当前回复对象)}
+        self._selected_history = None
+        self._retry_chats = set()
         self._chat = ""  # 微信当前开着的会话
         self._shown = ""  # 界面上正在看的会话（浏览时和上面不一样）
         self.win = _MainWindow(self._relayout)
         self.win.setObjectName("assistantWindow")
-        self.win.setWindowTitle("Jev · 微信回复助手")
+        self.win.setWindowTitle(f"Jev · {settings.chat_app_name()}回复助手")
         self.win.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.win.setStyleSheet(
             "QWidget#assistantWindow { background: #f5f7f6; border: 1px solid #dce3de; border-radius: 14px; }"
@@ -196,15 +206,15 @@ class Overlay:
         name.setFixedWidth(40)
         name.setAttribute(Qt.WA_TransparentForMouseEvents)
         title.addWidget(name)
-        self.subtitle = _label("微信回复助手", 12, _MUTED)
+        self.subtitle = _label(f"{settings.chat_app_name()}回复助手", 12, _MUTED)
         self.subtitle.setAttribute(Qt.WA_TransparentForMouseEvents)
         title.addWidget(self.subtitle, 1)
         self.captureSwitch = SwitchButton(header)
         self.captureSwitch.setOnText("采集中")
         self.captureSwitch.setOffText("已暂停")
-        self.captureSwitch.setToolTip("开启或暂停微信采集")
-        self.captureSwitch.setAccessibleName("开启或暂停微信采集")
-        self.captureSwitch.setChecked(True)
+        self.captureSwitch.setToolTip(f"开启或暂停{settings.chat_app_name()}采集")
+        self.captureSwitch.setAccessibleName(f"开启或暂停{settings.chat_app_name()}采集")
+        self.captureSwitch.setChecked(False)
         self.captureSwitch.checkedChanged.connect(self._capture_toggled)
         title.addWidget(self.captureSwitch)
         self.settingsButton = _tool(FIF.SETTING, "设置", self.open_settings, header)
@@ -246,8 +256,9 @@ class Overlay:
         self.win.resize(min(440, screen.width() - 32), min(820, screen.height() - 48))
         self.win.move(screen.right() - self.win.width() - 20, screen.top() + 24)
         self._relayout(self.win.width(), self.win.height())  # resizeEvent 补不到构造时这一次
-        self.set_status("等待新消息" if settings.has_key() else "需要配置模型",
-                        "idle" if settings.has_key() else "warning")
+        self.set_capture(False, "会话内容不再读取")
+        if not settings.has_key():
+            self.set_status("请先在设置中配置模型", "warning")
         self.win.show()
 
     def _scroll_page(self):
@@ -308,7 +319,7 @@ class Overlay:
         self.chatBox.setMinimumWidth(0)  # 别让会话名的长度撑开整行，宽度交给 stretch
         self.chatBox.setPlaceholderText("尚未识别到会话")
         self.chatBox.setAccessibleName("当前会话")
-        self.chatBox.setToolTip("微信切到哪个会话这里就跟到哪个；也可以自己选一个，只看它的记录和建议")
+        self.chatBox.setToolTip("聊天窗口切到哪个会话这里就跟到哪个；也可以自己选一个，只看它的记录和建议")
         self.chatBox.currentIndexChanged.connect(self._on_chat_selected)
         chat_row.addWidget(self.chatBox, 1)
         self.chatFollow = _label("", 11, _MUTED)
@@ -335,8 +346,17 @@ class Overlay:
         target_row.addWidget(self.atCheck)
         self.targetRow.hide()
         body.addWidget(self.targetRow)
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
         self.status = _label("", 12, _MUTED)
-        body.addWidget(self.status)
+        status_row.addWidget(self.status, 1)
+        self.retryButton = PushButton("重试")
+        self.retryButton.setAccessibleName("重新生成回复")
+        self.retryButton.setToolTip("上次生成失败时，使用相同的聊天内容再试一次")
+        self.retryButton.clicked.connect(self._retry_clicked)
+        self.retryButton.hide()
+        status_row.addWidget(self.retryButton)
+        body.addLayout(status_row)
         self.progress = IndeterminateProgressBar()
         self.progress.setFixedHeight(3)
         self.progress.hide()
@@ -367,7 +387,7 @@ class Overlay:
         insight_box.addWidget(self.summary)
         self.intent = _label("", 12, _MUTED)
         insight_box.addWidget(self.intent)
-        self.insight.setToolTip("根据当前聊天片段推测，可能理解有偏差。紧张度为 0–9 的参考评分。")
+        self.insight.setToolTip("根据当前聊天片段推测，可能理解有偏差。紧张度/重视度为 0–9 的参考评分：身体不适、情绪低落和关系冲突都会提高。")
         self.insight.hide()
         body.addWidget(self.insight)
 
@@ -381,7 +401,7 @@ class Overlay:
         self.emptyTitle = _label("等待对方的新消息", 17, "#304c3c", True)
         self.emptyTitle.setAlignment(Qt.AlignCenter)
         empty_box.addWidget(self.emptyTitle)
-        self.emptyHint = _label("保持微信聊天窗口打开。\n收到新消息后，回复建议会出现在这里。", 13, _MUTED)
+        self.emptyHint = _label("保持聊天窗口打开。\n收到新消息后，回复建议会出现在这里。", 13, _MUTED)
         self.emptyHint.setAlignment(Qt.AlignCenter)
         empty_box.addWidget(self.emptyHint)
         self.setupButton = PrimaryPushButton("前往设置")
@@ -403,13 +423,20 @@ class Overlay:
         self.historyButton.clicked.connect(self._toggle_history)
         self.historyButton.setAccessibleName("展开或收起聊天记录")
         body.addWidget(self.historyButton)
-        self.feed = PlainTextEdit()
-        self.feed.setReadOnly(True)
-        self.feed.setPlaceholderText("识别到的聊天内容会显示在这里")
-        self.feed.setMaximumBlockCount(_LOG_LINES)
+        self.feed = QListWidget()
+        self.feed.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.feed.setWordWrap(True)
+        self.feed.setTextElideMode(Qt.ElideNone)
+        self.feed.setSpacing(2)
         self.feed.setFixedHeight(160)
+        self.feed.itemClicked.connect(self._history_item_clicked)
         self.feed.hide()
         body.addWidget(self.feed)
+        self.selectMessageButton = PushButton("按选中消息生成回复")
+        self.selectMessageButton.setToolTip("点击聊天记录中的一条消息，再按这里；会按该消息之前的上下文重新生成")
+        self.selectMessageButton.clicked.connect(self._generate_selected_history)
+        self.selectMessageButton.hide()
+        body.addWidget(self.selectMessageButton)
         self._history_title()
         body.addStretch(1)
 
@@ -425,6 +452,29 @@ class Overlay:
         box.setContentsMargins(16, 16, 16, 18)
         box.setSpacing(12)
         box.addWidget(_label("回复偏好", 16, "#304c3c", True))
+        app_label = _label("聊天窗口", 13)
+        box.addWidget(app_label)
+        self.chatAppBox = ComboBox()
+        self.chatAppBox.addItems(["微信", "QQ"])
+        self.chatAppBox.setAccessibleName("聊天窗口")
+        app_label.setBuddy(self.chatAppBox)
+        box.addWidget(self.chatAppBox)
+        box.addWidget(self._hint("选择要采集和填入的聊天软件；保存后会自动切换采集窗口。"))
+        judge_label = _label("判断方式", 13)
+        box.addWidget(judge_label)
+        self.judgeModeBox = ComboBox()
+        self.judgeModeBox.addItems([
+            "跟随下方起草模型（共用同一把 Key）",
+            "原版 Jev（OpenRouter / TypeSafe）",
+        ])
+        self.judgeModeBox.setAccessibleName("判断方式")
+        judge_label.setBuddy(self.judgeModeBox)
+        box.addWidget(self.judgeModeBox)
+        box.addWidget(self._hint(
+            "跟随模式会使用下方选中的来源、模型和同一把起草 Key 完成判断；"
+            "选 DeepSeek、GLM、Kimi、OpenAI、OpenRouter 或自定义接口都可以。原版 Jev 才需要上面的独立密钥。"
+            "保存设置允许暂时不填，真正生成前才检查 Key。"
+        ))
         relation_label = _label("你们的关系", 13)
         box.addWidget(relation_label)
         self.relationshipBox = ComboBox()
@@ -449,6 +499,35 @@ class Overlay:
         style_label.setBuddy(self.styleEdit)
         box.addWidget(self.styleEdit)
         box.addWidget(self._hint("候选本来就照着你最近发的消息模仿；这里可以再补一句你自己的口吻。"))
+        profile_label = _label("回复策略", 13)
+        box.addWidget(profile_label)
+        self.profileBox = ComboBox()
+        self.profileBox.addItems([
+            "自动识别（按关系和场景）", "自然聊天（手动）", "恋人安抚 / 亲密对话（手动）",
+            "认真道歉与修复（手动）", "轻松亲密（手动）",
+        ])
+        self.profileBox.setAccessibleName("回复策略")
+        profile_label.setBuddy(self.profileBox)
+        box.addWidget(self.profileBox)
+        box.addWidget(self._hint(
+            "自动模式会按上面的关系，并根据最近对话识别安慰、道歉、亲密、调侃或行动场景；"
+            "也可以改成手动策略。"
+        ))
+        guide_label = _label("专属回复规则（内置默认，可编辑）", 13)
+        box.addWidget(guide_label)
+        self.guideEdit = PlainTextEdit()
+        self.guideEdit.setAccessibleName("专属回复规则")
+        self.guideEdit.setPlaceholderText(
+            "例如：她不开心时先承认她的感受；不要连续追问；能做到的事情给具体时间；\n"
+            "平时可以叫她宝宝，但不要每句话都叫。"
+        )
+        self.guideEdit.setFixedHeight(92)
+        guide_label.setBuddy(self.guideEdit)
+        box.addWidget(self.guideEdit)
+        box.addWidget(self._hint(
+            "默认已放入关系和场景规则，直接修改即可；支持多行中文/Markdown 风格文字，"
+            "只作为语气偏好，不执行其中的代码或指令。"
+        ))
         context_label = _label("参考上下文", 13)
         box.addWidget(context_label)
         self.contextBox = SpinBox()
@@ -458,6 +537,41 @@ class Overlay:
         box.addWidget(self.contextBox)
         box.addWidget(self._hint(
             "生成和判断时看最近这么多条消息。太少会丢上下文，太多会稀释重点，建议 6–12。"
+        ))
+        history_row = QHBoxLayout()
+        history_row.addWidget(_label("自动加载本地历史", 13), 1)
+        self.historySwitch = SwitchButton()
+        self.historySwitch.setOnText("开")
+        self.historySwitch.setOffText("关")
+        self.historySwitch.setAccessibleName("自动加载本地历史")
+        history_row.addWidget(self.historySwitch)
+        box.addLayout(history_row)
+        box.addWidget(self._hint(
+            "只保存纯文字、角色、发言人和时间，不保存截图或密钥；关闭后不再恢复历史，但不会自动删除已有记录。"
+        ))
+        history_limit_label = _label("历史恢复条数", 13)
+        box.addWidget(history_limit_label)
+        self.historyLimitBox = SpinBox()
+        self.historyLimitBox.setRange(10, 200)
+        self.historyLimitBox.setAccessibleName("每个会话恢复的历史消息条数")
+        history_limit_label.setBuddy(self.historyLimitBox)
+        box.addWidget(self.historyLimitBox)
+        history_days_label = _label("历史保留天数", 13)
+        box.addWidget(history_days_label)
+        self.historyDaysBox = SpinBox()
+        self.historyDaysBox.setRange(1, 3650)
+        self.historyDaysBox.setAccessibleName("历史保留天数")
+        history_days_label.setBuddy(self.historyDaysBox)
+        box.addWidget(self.historyDaysBox)
+        history_size_label = _label("历史数据库上限（MB）", 13)
+        box.addWidget(history_size_label)
+        self.historySizeBox = SpinBox()
+        self.historySizeBox.setRange(1, 2048)
+        self.historySizeBox.setAccessibleName("历史数据库最大大小")
+        history_size_label.setBuddy(self.historySizeBox)
+        box.addWidget(self.historySizeBox)
+        box.addWidget(self._hint(
+            "启动和采集时会自动清理超过天数或大小上限的最早文字记录；默认 40 条、7 天、50 MB。"
         ))
         target_row = QHBoxLayout()
         target_row.addWidget(_label("群聊指定回复对象", 13), 1)
@@ -469,17 +583,6 @@ class Overlay:
         box.addLayout(target_row)
         box.addWidget(self._hint(
             "开了以后群聊里可以选回复给谁，候选会针对 TA 写，填入时可带 @。关了就正常回复。"
-        ))
-        update_row = QHBoxLayout()
-        update_row.addWidget(_label("启动时检查更新", 13), 1)
-        self.updateSwitch = SwitchButton()
-        self.updateSwitch.setOnText("开")
-        self.updateSwitch.setOffText("关")
-        self.updateSwitch.setAccessibleName("启动时检查更新")
-        update_row.addWidget(self.updateSwitch)
-        box.addLayout(update_row)
-        box.addWidget(self._hint(
-            "只向 GitHub 查最新版本号，不发送任何数据。国内访问 GitHub 慢的话关掉也行。"
         ))
         debug_row = QHBoxLayout()
         debug_row.addWidget(_label("调试视图", 13), 1)
@@ -505,7 +608,7 @@ class Overlay:
         self._fetched.done.connect(self._models_fetched)
         self.jev = self._model_group(box, "判断 · Jev", "jev", providers.JEV_PROVIDERS)
         box.addWidget(self._hint(
-            "判断意图、紧张度，并给三条候选排序。两家给的是同一个 Jev，必填。"
+            "原版判断：识别意图、情绪、紧张度，并给三条候选排序。只有选择原版 Jev 时才需要这里的密钥。"
         ))
         self.draft = self._model_group(box, "起草 · 语言模型", "draft", providers.DRAFT_PROVIDERS)
         box.addWidget(self._hint(
@@ -532,6 +635,11 @@ class Overlay:
         back = PushButton("返回")
         back.clicked.connect(self._back_home)
         actions.addWidget(back)
+        reset = PushButton("重置设置")
+        reset.setToolTip("清空本机保存的 API 密钥和个人配置，恢复分享用默认值")
+        reset.setAccessibleName("重置设置并清空密钥")
+        reset.clicked.connect(self._reset_settings)
+        actions.addWidget(reset)
         actions.addStretch(1)
         self.saveButton = PrimaryPushButton("保存设置")
         self.saveButton.clicked.connect(self._save)
@@ -584,7 +692,7 @@ class Overlay:
         box.addWidget(group.keyEdit)
         box.addWidget(self._hint(
             "OpenRouter 的 key 或 TypeSafe 的 key，看上面选的来源。" if kind == "jev"
-            else "上面选哪家就填哪家的 key；换来源重填一次，只存这一把。"))
+            else "上面选哪家就填哪家的 key；DeepSeek 判断模式也会复用这把起草 key；换来源重填一次，只存这一把。"))
         model_label = _label("模型", 13)
         box.addWidget(model_label)
         row = QHBoxLayout()
@@ -622,13 +730,23 @@ class Overlay:
         """两组共用：密钥已配置/未配置、占位文案、自定义 Base URL 行的显隐，
         外加紧凑模式下把来源按钮上的文字省略——ComboBox 是 QPushButton，
         minimumSizeHint 按整段文字算，不会自动换行/省略，长名字会把设置页撑宽。"""
+        # 0=跟随起草，1=原版 Jev。
+        # 只有原版 Jev 需要启用上面的独立来源/密钥。
+        unused_jev = self.judgeModeBox.currentIndex() != 1
         for group in (self.jev, self.draft):
             provider = self._provider_of(group)
             name = group.table[provider].name
             configured = bool(group.stored_key())
-            group.keyState.setText("已配置" if configured else "未配置")
+            unused = group.kind == "jev" and unused_jev
+            group.keyState.setText("本模式不用" if unused else ("已配置" if configured else "未配置"))
             group.keyEdit.setPlaceholderText(
-                "已配置，留空保留" if configured else f"输入 {name} API 密钥")
+                "跟随/DeepSeek 模式下无需填写" if unused
+                else ("已配置，留空保留" if configured else f"输入 {name} API 密钥"))
+            group.keyEdit.setEnabled(not unused)
+            group.providerBox.setEnabled(not unused)
+            group.modelBox.setEnabled(not unused)
+            # 原来的按钮允许先点再提示“先填密钥”；只有 DeepSeek 模式下不用的 Jev 组才禁用。
+            group.fetchButton.setEnabled(not unused)
             if self._compact:
                 name = group.providerBox.fontMetrics().elidedText(name, Qt.ElideRight, 180)
             group.providerBox.setText(name)
@@ -698,14 +816,24 @@ class Overlay:
         self.relationshipBox.setCurrentIndex(index)
         self.relEdit.setText(relationship if _RELATIONSHIPS[index][1] is None else "")
         self.relEdit.setVisible(_RELATIONSHIPS[index][1] is None)
+        self.chatAppBox.setCurrentIndex(1 if settings.chat_app() == "qq" else 0)
+        self.judgeModeBox.setCurrentIndex({"follow": 0, "jev": 1}.get(
+            settings.judge_mode(), 0))
         self.styleEdit.setText(settings.style())
+        self.profileBox.setCurrentIndex(
+            {"auto": 0, "natural": 1, "girlfriend": 2, "repair": 3, "playful": 4}.get(
+                settings.reply_profile(), 0))
+        self.guideEdit.setPlainText(settings.reply_guide())
         self.contextBox.setValue(settings.context())
+        self.historySwitch.setChecked(settings.history_enabled())
+        self.historyLimitBox.setValue(settings.history_limit())
+        self.historyDaysBox.setValue(settings.history_retention_days())
+        self.historySizeBox.setValue(settings.history_max_mb())
         self.targetSwitch.setChecked(settings.reply_target())
         self._set_group(self.jev, settings.jev_provider(), settings.jev_model())
         self._set_group(self.draft, settings.draft_provider(), settings.draft_model())
         self.baseEdit.setText(settings.draft_base_url())
         self.thinkingSwitch.setChecked(settings.thinking())
-        self.updateSwitch.setChecked(settings.check_update())
         self.set_debug_switch(settings.debug_view())  # 屏蔽信号地拨，别在加载时开关一遍窗口
         self._sync_model_fields()  # 上面屏蔽了信号，这里补一次
         self.settingsFeedback.hide()
@@ -713,9 +841,12 @@ class Overlay:
     def _save(self):
         relationship = _RELATIONSHIPS[self.relationshipBox.currentIndex()][1]
         relationship = relationship or self.relEdit.text().strip()
+        chat_app = "qq" if self.chatAppBox.currentIndex() == 1 else "wechat"
+        judge_mode = ("follow", "jev")[self.judgeModeBox.currentIndex()]
         jev_provider = self._provider_of(self.jev)
         draft_provider = self._provider_of(self.draft)
         base = self.baseEdit.text().strip()
+        profile = ("auto", "natural", "girlfriend", "repair", "playful")[self.profileBox.currentIndex()]
         if not relationship:
             self._settings_feedback("请填写关系背景，或选择一个已有选项。", error=True)
             self.relEdit.setFocus()
@@ -724,12 +855,11 @@ class Overlay:
             self._settings_feedback("自定义来源要填 Base URL。", error=True)
             self.baseEdit.setFocus()
             return
-        for group, provider in ((self.jev, jev_provider), (self.draft, draft_provider)):
+        groups = [(self.draft, draft_provider)]
+        if judge_mode == "jev":
+            groups.insert(0, (self.jev, jev_provider))
+        for group, provider in groups:
             name = group.table[provider].name
-            if not group.keyEdit.text().strip() and not group.stored_key():
-                self._settings_feedback(f"请先填写 {group.keyTitle} 的 API 密钥。", error=True)
-                group.keyEdit.setFocus()
-                return
             if not group.modelBox.text().strip():
                 self._settings_feedback(f"{name} 请先获取并选择一个模型。", error=True)
                 group.modelBox.setFocus()
@@ -745,18 +875,63 @@ class Overlay:
                           draft_base_url_text=base,
                           reply_target_on=self.targetSwitch.isChecked(),
                           style_text=self.styleEdit.text().strip(),
+                          reply_profile_text=profile,
+                          reply_guide_text=self.guideEdit.toPlainText().strip(),
                           thinking_on=self.thinkingSwitch.isChecked(),
-                          check_update_on=self.updateSwitch.isChecked())
+                          chat_app_text=chat_app,
+                          judge_mode_text=judge_mode,
+                          history_enabled_on=self.historySwitch.isChecked(),
+                          history_limit_n=self.historyLimitBox.value(),
+                          history_days_n=self.historyDaysBox.value(),
+                          history_max_mb_n=self.historySizeBox.value())
         except Exception:
             self._settings_feedback("保存失败，请检查配置文件是否可写后重试。", error=True)
             return
         self._load_settings()
+        self.win.setWindowTitle(f"Jev · {settings.chat_app_name()}回复助手")
+        self.subtitle.setText(f"{settings.chat_app_name()}回复助手")
+        self.captureSwitch.setToolTip(f"开启或暂停{settings.chat_app_name()}采集")
+        self.captureSwitch.setAccessibleName(f"开启或暂停{settings.chat_app_name()}采集")
+        if self.on_settings_saved:
+            self.on_settings_saved()
         self._render_targets()  # 开关刚改过，回到首页时这一行该显该藏得重算一次
         self._settings_feedback("设置已保存，将用于下一次回复。")
         self.setupButton.hide()
         if not self.cands and not self._busy:
             self._empty_text()
             self.set_status("设置已就绪，等待新消息", "idle")
+
+    def _reset_settings(self):
+        """清空本机 key 和个人配置，方便把当前程序目录分享出去。"""
+        answer = QMessageBox.question(
+            self.win, "重置设置",
+            "将清空本机保存的全部 API 密钥、个人设置和聊天历史，恢复为分享用默认值。\n确定继续吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            settings.reset()
+        except Exception:
+            self._settings_feedback("重置失败，请检查配置文件是否可写。", error=True)
+            return
+        self._load_settings()
+        self.win.setWindowTitle(f"Jev · {settings.chat_app_name()}回复助手")
+        self.subtitle.setText(f"{settings.chat_app_name()}回复助手")
+        self.captureSwitch.setToolTip(f"开启或暂停{settings.chat_app_name()}采集")
+        self.captureSwitch.setAccessibleName(f"开启或暂停{settings.chat_app_name()}采集")
+        self.captureSwitch.blockSignals(True)
+        self.captureSwitch.setChecked(False)
+        self.captureSwitch.blockSignals(False)
+        if self.on_settings_saved:
+            self.on_settings_saved()
+        if self.on_settings_reset:
+            self.on_settings_reset()
+        self._clear_cards()
+        self.cands = []
+        self._current = False
+        self.insight.hide()
+        self.referenceNote.hide()
+        self._settings_feedback("已重置：密钥、设置和本地聊天历史已清空，聊天窗口恢复为微信，采集默认暂停。")
 
     def _debug_toggled(self, on):
         """调试视图独立于「保存设置」：拨一下就开窗/收窗，顺手落盘，重启还在。"""
@@ -810,6 +985,51 @@ class Overlay:
         self.app.clipboard().setText(self.cands[index])
         self.set_status("回复已复制，可在微信中粘贴并修改。", "success")
 
+    def _retry_clicked(self):
+        """把最近一次失败的同一会话、同一批消息再交给后台生成。"""
+        if self._busy or not self._shown or self._shown not in self._retry_chats:
+            return
+        self.retryButton.setEnabled(False)
+        if self.on_retry:
+            self.on_retry(self._shown)
+        self._sync_retry()
+
+    def _history_item_clicked(self, item):
+        """聊天记录里的消息可选中；状态行没有 UserRole 数据，不参与生成。"""
+        data = item.data(Qt.UserRole)
+        if not data:
+            self._selected_history = None
+            self.selectMessageButton.hide()
+            return
+        self._selected_history = data
+        _, _, who, text, name, timestamp = data
+        speaker = (name or "对方") if who == "her" else "我"
+        self.selectMessageButton.setText("按这条消息生成回复")
+        self.selectMessageButton.setToolTip("会使用这条消息之前的聊天上下文，忽略之后的表情包或已发送内容")
+        self.selectMessageButton.show()
+        self.set_status(f"已选中 {timestamp} 的「{speaker}」消息，点击下方重新生成", "idle")
+
+    def _generate_selected_history(self):
+        if self._busy or not self._selected_history or not self.on_history_generate:
+            return
+        self.selectMessageButton.setEnabled(False)
+        self.on_history_generate(self._selected_history)
+
+    def _sync_retry(self):
+        visible = self._shown in self._retry_chats and not self._busy
+        self.retryButton.setVisible(visible)
+        self.retryButton.setEnabled(visible)
+
+    def mark_retry(self, title):
+        self._retry_chats.add(title)
+        if title == self._shown:
+            self._sync_retry()
+
+    def clear_retry(self, title):
+        self._retry_chats.discard(title)
+        if title == self._shown:
+            self._sync_retry()
+
     def _capture_toggled(self, on):
         """用户自己拨的开关：界面先改，再通知父进程去开/停采集。"""
         self._capture_text(on)
@@ -833,7 +1053,7 @@ class Overlay:
         """开关状态对应的状态行和空态文案。已有的候选不受影响，暂停了照样能填入/复制。"""
         configured = settings.has_key()
         if not on:
-            self.set_status(reason or "采集已暂停，微信内容不再读取", "warning")
+            self.set_status(reason or "会话内容不再读取", "warning")
         elif configured:
             self.set_status("等待新消息", "idle")
         else:
@@ -842,7 +1062,7 @@ class Overlay:
             return
         if not on:
             self.emptyTitle.setText("采集已暂停")
-            self.emptyHint.setText("微信里的内容暂时不再读取。\n打开标题栏的开关，继续接收新消息。")
+            self.emptyHint.setText("会话内容暂时不再读取。\n打开标题栏的开关，继续接收新消息。")
             self.setupButton.setVisible(not configured)
         else:
             self._empty_text()
@@ -850,6 +1070,9 @@ class Overlay:
     def set_busy(self, busy):
         self._busy = busy
         self.progress.setVisible(busy)
+        self.selectMessageButton.setEnabled(not busy)
+        if busy:
+            self.retryButton.hide()
         if busy:
             self.invalidate_replies()
             self.progress.start()
@@ -864,12 +1087,16 @@ class Overlay:
                 self._empty_text()
         for card in self.cards:
             card.set_available(self._current and not busy)
+        if not busy:
+            self._sync_retry()
+            if self._selected_history and not self.feed.isHidden():
+                self.selectMessageButton.show()
 
     def _empty_text(self):
         """空态卡片的默认文案，配好没配好两套说法。"""
         configured = settings.has_key()
         self.emptyTitle.setText("等待对方的新消息" if configured else "先设置，再开始")
-        self.emptyHint.setText("保持微信聊天窗口打开。\n收到新消息后，回复建议会出现在这里。"
+        self.emptyHint.setText("保持聊天窗口打开。\n收到新消息后，回复建议会出现在这里。"
                                if configured else "配置模型和关系背景，\n让建议更贴近你们的对话。")
         self.setupButton.setVisible(not configured)
 
@@ -896,6 +1123,10 @@ class Overlay:
 
     def _toggle_history(self):
         self.feed.setVisible(self.feed.isHidden())
+        if self.feed.isHidden():
+            self.selectMessageButton.hide()
+        elif self._selected_history:
+            self.selectMessageButton.show()
         self._history_title()
 
     def _history_title(self):
@@ -905,11 +1136,23 @@ class Overlay:
 
     def log(self, line):
         """采集状态行：只进正在看的那个会话，不按会话存。"""
-        bar = self.feed.verticalScrollBar()
-        follow = self.feed.isHidden() or bar.value() >= bar.maximum() - 4
-        self.feed.appendPlainText(line)
-        if follow:
-            bar.setValue(bar.maximum())
+        item = QListWidgetItem(line)
+        item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
+        self.feed.addItem(item)
+        while self.feed.count() > _LOG_LINES:
+            self.feed.takeItem(0)
+        self.feed.scrollToBottom()
+
+    def _add_message_item(self, chat, index, record):
+        who, text, name, timestamp = (record["who"], record["text"],
+                                      record["name"], record["timestamp"])
+        speaker = (name or "对方") if who == "her" else "我"
+        item = QListWidgetItem(f"{timestamp}  {speaker}\n{text}")
+        item.setToolTip("点击选中这条消息，再按下方按钮生成回复")
+        item.setData(Qt.UserRole, (chat, index, who, text, name, timestamp))
+        self.feed.addItem(item)
+        self.feed.scrollToBottom()
+        return item
 
     def log_message(self, who, text, name="", timestamp=None, chat=None):
         """按会话存一份；只有正在看的那个会往显示区里写。"""
@@ -917,17 +1160,40 @@ class Overlay:
         speaker = (name or "对方") if who == "her" else "我"
         timestamp = timestamp or datetime.now().strftime("%H:%M")
         self.counts[chat] = self.counts.get(chat, 0) + 1
-        lines = self.feeds.setdefault(chat, [])
-        lines.append(f"{timestamp}  {speaker}\n{text}\n")
-        del lines[:-_LOG_LINES]
+        record = {"who": who, "text": text, "name": name, "timestamp": timestamp}
+        records = self.feeds.setdefault(chat, [])
+        records.append(record)
+        del records[:-_LOG_LINES]
         if who == "her":
             self.hers[chat] = text
         self._add_chat(chat)
         if chat != self._shown:
             return
-        self.log(lines[-1])
+        self._add_message_item(chat, len(records) - 1, record)
         if who == "her":
             self._show_latest(text)
+        self._history_title()
+
+    def restore_messages(self, chat, records):
+        """把本地历史恢复到现有聊天记录视图；只更新内存和 UI，不再次写库。"""
+        for record in records or []:
+            self.log_message(record.get("who", "her"), record.get("text", ""),
+                             record.get("name", ""), record.get("timestamp") or "", chat=chat)
+
+    def clear_history(self):
+        """重置设置后的界面清空；磁盘清理由 app.settings.reset() 完成。"""
+        self.feeds.clear()
+        self.counts.clear()
+        self.hers.clear()
+        self.targets.clear()
+        self._selected_history = None
+        self._chat = ""
+        self._shown = ""
+        self.feed.clear()
+        self.chatBox.blockSignals(True)
+        self.chatBox.clear()
+        self.chatBox.blockSignals(False)
+        self.selectMessageButton.hide()
         self._history_title()
 
     def _show_latest(self, text):
@@ -971,8 +1237,10 @@ class Overlay:
         """换正在看的会话：记录、对方最近说、条数、上次的建议一起换过去。"""
         self._shown = title
         self.feed.clear()
-        for line in self.feeds.get(title, []):
-            self.feed.appendPlainText(line)
+        self._selected_history = None
+        self.selectMessageButton.hide()
+        for index, record in enumerate(self.feeds.get(title, [])):
+            self._add_message_item(title, index, record)
         her = self.hers.get(title)
         if her:
             self._show_latest(her)
@@ -982,6 +1250,7 @@ class Overlay:
         self._follow_text()
         self._render_targets()
         self.show_cached(self.result_of(title) if self.result_of else None)
+        self._sync_retry()
 
     def set_targets(self, chat, senders, current):
         """某个会话的发言人名单（最近的在前）和当前回复对象；正看着它才重画。"""
@@ -1019,7 +1288,7 @@ class Overlay:
         return self.atCheck.isChecked()
 
     def _follow_text(self):
-        self.chatFollow.setText(("跟随微信" if self._shown == self._chat else "浏览中") if self._chat else "")
+        self.chatFollow.setText(("跟随对话" if self._shown == self._chat else "浏览中") if self._chat else "")
 
     def show_cached(self, result):
         """把某个会话上次的结果放回界面；没有就回到空态。浏览别的会话时只给看不给填——
@@ -1062,10 +1331,11 @@ class Overlay:
         answers = result.get("answers") or {}
         self.summary.setText("建议：" + _choice(answers, "best_action"))
         self.intent.setText("可能意图 · " + _choice(answers, "true_intent") +
+                            "\n当前场景 · " + _choice(answers, "reply_scene") +
                             "\n可能需要 · " + _choice(answers, "she_needs"))
         score = (answers.get("danger_level") or {}).get("score")
         valid_score = isinstance(score, (int, float)) and isfinite(score) and 0 <= score <= 9
-        self.tension.setText(f"紧张度 {score:.0f}/9" if valid_score else "紧张度待判断")
+        self.tension.setText(f"紧张度/重视度 {score:.0f}/9" if valid_score else "紧张度/重视度待判断")
         color = "#996819" if valid_score and score >= 3 else _MUTED
         if valid_score and score >= 6:
             color = "#b44832"

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""把选中的候选填进微信输入框：写剪贴板 → 点输入框 → Ctrl+V。绝不发回车、绝不点发送。"""
+"""把选中的候选填进微信/QQ输入框：写剪贴板 → 点输入框 → Ctrl+V。绝不发回车、绝不点发送。"""
 import ctypes
 import ctypes.wintypes as w
 import time
@@ -46,7 +46,29 @@ def set_clipboard(text):
     raise RuntimeError("OpenClipboard 连续失败，剪贴板被其他程序占用")
 
 
-def fill(hwnd, area, text):
+def input_point(rect, area, chat_app="wechat"):
+    """按窗口矩形和消息区计算一个落在编辑区的安全点击点（纯计算，便于测试）。"""
+    x0, _, x1, y1 = area
+    if chat_app == "qq":
+        # QQ 的 y1 是消息区和编辑区的分隔线，y1 后面先是工具栏，再是输入文字区；
+        # x0 左边也有表情、剪刀、图片等工具按钮。原来的 x0+70 / y1+48
+        # 正好会落在表情按钮上，导致点击「填入」反而打开表情面板。
+        # 取编辑区的中部，并给左右两侧的工具/发送按钮留出安全边距。
+        input_left = rect.left + x0 + 110
+        input_right = rect.right - 180
+        input_top = rect.top + y1 + 70
+        input_bottom = rect.bottom - 85
+        if input_right <= input_left:
+            input_left = rect.left + x0 + 30
+            input_right = rect.left + x1 - 30
+        if input_bottom <= input_top:
+            input_top = rect.top + y1 + 35
+            input_bottom = rect.bottom - 45
+        return (input_left + input_right) // 2, (input_top + input_bottom) // 2
+    return rect.left + x0 + 60, rect.top + y1 + 40
+
+
+def fill(hwnd, area, text, chat_app="wechat"):
     """area = 消息区 (x0, y0, x1, y1)；输入框就在底线 y1 下面。"""
     from app.capture import unminimize
 
@@ -54,8 +76,7 @@ def fill(hwnd, area, text):
     r = w.RECT()
     if ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(r), ctypes.sizeof(r)) != 0:  # 扩展边界，跟 WGC 帧对齐
         u32.GetWindowRect(hwnd, ctypes.byref(r))
-    x0, _, _, y1 = area
-    cx, cy = r.left + x0 + 60, r.top + y1 + 40  # 分隔线下 40px = 输入框文字区；工具栏和「发送」在输入区最底下，碰不到
+    cx, cy = input_point(r, area, chat_app)
     unminimize(hwnd)
 
     # SetForegroundWindow 有前台窗口保护，普通后台进程会被拒；AttachThreadInput 绕过

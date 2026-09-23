@@ -1,18 +1,26 @@
-__pycache__/
-*.pyc
-.venv/
-venv/
-.idea/
-.vscode/
-.DS_Store
-
-# 每个人自己的关系设置，不进仓库（.gitignore 里 # 只能整行注释，写在模式后面会变成模式的一部分）
+# Local configuration and credentials
 config.json
-# 根目录下的临时截图（docs/ 里的照常提交）
-/*.png
-wechat_probe.png
+*.sqlite3
+*.sqlite3-*
+*.db
+*.bak
 
-# PyInstaller 产物（jev.spec 是源文件，照常提交）
+# Python environments and caches
+.venv/
+.venv311/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build and packaging output
 build/
 dist/
+release-*/
+source-*/
 *.spec.bak
+
+# Local tooling / editor files
+.idea/
+.vscode/
+.pytest_cache/

@@ -8,13 +8,32 @@ from __future__ import annotations
 try:
     from .draft import draft_candidates
     from .jev_client import JevError, ask
-    from .questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
+    from .deepseek_judge import ask as ask_deepseek
+    from .providers import DRAFT_PROVIDERS
+    from .questions import (JUDGE_QUESTIONS, build_rank_question, build_state,
+                            calibrate_answers, guidance_text)
 except ImportError:
     from draft import draft_candidates
     from jev_client import JevError, ask
-    from questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
+    from deepseek_judge import ask as ask_deepseek
+    from providers import DRAFT_PROVIDERS
+    from questions import (JUDGE_QUESTIONS, build_rank_question, build_state,
+                           calibrate_answers, guidance_text)
 
 _REPLY_IDX = {"reply_a": 0, "reply_b": 1, "reply_c": 2}
+
+
+def _needs_deepseek_rank(answers: dict) -> bool:
+    """低风险消息不再额外请求一次排序；身体/情绪/关系明显升高时保留排序。"""
+    answers = answers or {}
+    for name in ("danger_level", "emotion_score", "physical_score", "urgency_score",
+                 "relationship_sensitivity_score"):
+        try:
+            if float((answers.get(name) or {}).get("score", 0)) >= 4:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 def _add_usage(total: dict, one: dict | None) -> None:
@@ -26,8 +45,10 @@ def _add_usage(total: dict, one: dict | None) -> None:
 def analyze(messages: list, relationship: str, model: str | None = None,
             timeout: float = 30, context: int = 10, provider: str = "deepseek",
             base_url: str | None = None, reply_to: str | None = None, style: str = "",
+            profile: str = "natural", reply_guide: str = "",
             thinking: bool = False, jev_provider: str = "openrouter",
-            jev_model: str | None = None) -> dict:
+            jev_model: str | None = None, judge_mode: str = "jev",
+            judge_base_url: str | None = None) -> dict:
     """messages: [(from, text)] from ∈ {her, me}，最新一条在最后；
     群聊里可以带第三项 name（说这句话的人），单聊不带。
     context: 起草和判断各看最近多少条消息（用户设置里的「参考上下文」）。
@@ -35,8 +56,11 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     jev_provider / jev_model: 判断和排序走哪家、哪个模型（core.providers.JEV_PROVIDERS）。
     reply_to: 群聊里指定回复给谁；None = 正常回复。
     style: 用户自己描述的说话风格，只影响起草。
+    profile / reply_guide: 内置关系策略和用户自定义起草规则，只影响起草。
     thinking: 起草时是否开思考模式，只影响起草，默认关。
     model / jev_model = None 用该来源的默认模型。
+    judge_mode="follow" 时，判断和排序跟随起草来源并共用 LLM_API_KEY；
+    judge_mode="deepseek" 是兼容旧配置的固定 DeepSeek 模式；jev 模式保持原行为。
 
     返回 {candidates, best_index, best_reply, scores, answers, usage, reply_to}。
     scores 是每条候选的胜出概率（0~1），取自 best_reply.probabilities，取不到记 0.0。
@@ -49,10 +73,23 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     usage: dict = {}
     answers: dict = {}
     judged = False
+    if judge_mode == "deepseek":
+        judge = lambda qs: ask_deepseek(
+            state, qs, model=jev_model or "deepseek-flash",
+            base_url=judge_base_url or "https://api.deepseek.com",
+            timeout=timeout)
+    elif judge_mode == "follow":
+        spec = DRAFT_PROVIDERS.get(provider, DRAFT_PROVIDERS["deepseek"])
+        judge = lambda qs: ask_deepseek(
+            state, qs, model=jev_model or spec.default,
+            base_url=judge_base_url or base_url or spec.base,
+            protocol=spec.protocol, timeout=timeout)
+    else:
+        judge = lambda qs: ask(state, qs, timeout=timeout,
+                                provider=jev_provider, model=jev_model)
     try:
-        first = ask(state, dict(JUDGE_QUESTIONS), timeout=timeout,
-                    provider=jev_provider, model=jev_model)
-        answers = first.get("answers") or {}
+        first = judge(dict(JUDGE_QUESTIONS))
+        answers = calibrate_answers(first.get("answers") or {}, messages)
         _add_usage(usage, first.get("usage"))
         judged = True
     except JevError:
@@ -61,20 +98,24 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     candidates = draft_candidates(messages, relationship, provider=provider, model=model,
                                   base_url=base_url, timeout=timeout, keep=context,
                                   reply_to=reply_to, style=style, thinking=thinking,
+                                  profile=profile, reply_guide=reply_guide,
                                   guidance=guidance_text(answers) if judged else None)
 
     questions = {} if judged else dict(JUDGE_QUESTIONS)
-    if len(candidates) >= 2:  # 起草只给了 1 条就没什么可排的，判断题照问
+    # 原版 Jev 保留原来的排序行为。DeepSeek 普通低风险消息用起草返回的第一条，
+    # 只有明显身体/情绪/关系风险才再请求一次候选排序，减少普通聊天的 token 消耗。
+    rank_needed = (judge_mode not in {"deepseek", "follow"}
+                   or not judged or _needs_deepseek_rank(answers))
+    if len(candidates) >= 2 and rank_needed:  # 起草只给了 1 条就没什么可排的
         questions.update(build_rank_question(candidates))
     if questions:
         try:
-            second = ask(state, questions, timeout=timeout,
-                         provider=jev_provider, model=jev_model)
+            second = judge(questions)
         except JevError:
             if not judged:  # 老路只有这一次调用，挂了就是挂了
                 raise
             second = {}  # 判断还在，只是没排上序：下面按第一条推荐
-        answers = {**answers, **(second.get("answers") or {})}
+        answers = calibrate_answers({**answers, **(second.get("answers") or {})}, messages)
         _add_usage(usage, second.get("usage"))
 
     best_key = (answers.get("best_reply") or {}).get("choice")
