@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Jev 微信回复助手
+Name[en]=Jev WeChat Assistant
+GenericName=WeChat reply assistant
+GenericName[zh_CN]=微信回复助手
+Comment=OCR 微信对话并给出候选回复（不自动发送）
+Comment[en]=OCR WeChat chats and draft replies (never auto-sends)
+Exec=@BIN@
+Icon=jev-chat-ubuntu
+Terminal=false
+StartupNotify=true
+StartupWMClass=jev-chat-ubuntu
+Categories=Network;InstantMessaging;Qt;
+Keywords=wechat;weixin;微信;jev;reply;
+SingleMainWindow=true
+DBusActivatable=false

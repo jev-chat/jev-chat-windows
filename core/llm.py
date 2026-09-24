@@ -16,6 +16,28 @@ except ImportError:
 
 # Anthropic 开思考模式时的预算：起草三句话用不上更多；max_tokens 必须比它大，下面会兜住
 _THINK_BUDGET = 2048
+# 阶跃 step-5 这类先写 reasoning 再写 content；额度不够时 content 是空串，解析就会报「候选: ''」
+_EMPTY_CONTENT_RETRY = 8192
+
+
+def _assistant_text(msg) -> str:
+    """assistant 正文。content 可能是 str、None，或 SDK 拆成的 parts 列表。不把 reasoning 当回复。"""
+    content = getattr(msg, "content", None)
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    if isinstance(content, list):
+        chunks = []
+        for part in content:
+            if isinstance(part, str):
+                chunks.append(part)
+            elif isinstance(part, dict):
+                chunks.append(str(part.get("text") or ""))
+            else:
+                chunks.append(str(getattr(part, "text", "") or ""))
+        joined = "".join(chunks).strip()
+        if joined:
+            return joined
+    return ""
 
 
 def _turns(user_turns: list[str], assistant: str = "assistant") -> list[dict]:
@@ -48,19 +70,37 @@ def _openai(base_url, api_key, model, system, user_turns, temperature, max_token
             extra_body, headers, timeout) -> str:
     import openai
 
+    text = ""
+    finish = ""
     try:
         client = openai.OpenAI(base_url=base_url or None, api_key=api_key,
                                timeout=timeout, max_retries=2,
                                **({"default_headers": headers} if headers else {}))
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": system}] + _turns(user_turns),
-            temperature=temperature, max_tokens=max_tokens,
-            stream=False,  # DeepSeek 要显式关；别家无所谓
-            **({"extra_body": extra_body} if extra_body else {}))
+        messages = [{"role": "system", "content": system}] + _turns(user_turns)
+        extra = {"extra_body": extra_body} if extra_body else {}
+
+        def once(tokens):
+            return client.chat.completions.create(
+                model=model, messages=messages, temperature=temperature,
+                max_tokens=tokens, stream=False,  # DeepSeek 要显式关；别家无所谓
+                **extra)
+
+        resp = once(max_tokens)
+        finish = getattr(resp.choices[0], "finish_reason", "") or ""
+        text = _assistant_text(resp.choices[0].message)
+        if not text and max_tokens < _EMPTY_CONTENT_RETRY:
+            resp = once(_EMPTY_CONTENT_RETRY)
+            finish = getattr(resp.choices[0], "finish_reason", "") or finish
+            text = _assistant_text(resp.choices[0].message)
     except Exception as exc:
         _fail(exc, "起草")
-    return resp.choices[0].message.content or ""
+    if not text:
+        raise JevError(
+            "起草模型只返回了思考、没有正文"
+            + (f"（finish={finish}）" if finish else "")
+            + "。阶跃 step-5 这类推理模型常这样，可换 step-3.5-flash 或把思考关掉后再试。"
+        )
+    return text
 
 
 def _anthropic(base_url, api_key, model, system, user_turns, temperature, max_tokens,
@@ -70,14 +110,14 @@ def _anthropic(base_url, api_key, model, system, user_turns, temperature, max_to
     extra = {}
     if thinking:
         extra["thinking"] = {"type": "enabled", "budget_tokens": _THINK_BUDGET}
-        temperature = 1.0  # 开了思考，Anthropic 只收 temperature=1
         max_tokens = max(max_tokens, _THINK_BUDGET + 1024)  # max_tokens 得装得下思考 + 正文
     try:
         client = anthropic.Anthropic(base_url=base_url or None, api_key=api_key,
                                      timeout=timeout, max_retries=2)
+        # anthropic>=1.8 的 Messages.create 已无 temperature，采样走模型默认
         message = client.messages.create(model=model, system=system,
                                          messages=_turns(user_turns), max_tokens=max_tokens,
-                                         temperature=temperature, **extra)
+                                         **extra)
     except Exception as exc:
         _fail(exc, "起草")
     # 开了思考的话前面还有 thinking 块，只取文本块
@@ -187,6 +227,9 @@ if __name__ == "__main__":
     out = chat("openai", "https://api.deepseek.com", "sk-ds", "deepseek-flash", "S", ["U"],
                temperature=1.2, max_tokens=400, extra_body={"thinking": {"type": "disabled"}})
     assert out == '["甲","乙","丙"]'
+    assert _assistant_text(_t.SimpleNamespace(content='["甲","乙","丙"]')) == '["甲","乙","丙"]'
+    assert _assistant_text(_t.SimpleNamespace(content=None, reasoning="think")) == ""
+    assert _assistant_text(_t.SimpleNamespace(content=[{"text": '["甲"]'}])) == '["甲"]'
     assert seen["openai.init"]["base_url"] == "https://api.deepseek.com"
     assert seen["openai.init"]["api_key"] == "sk-ds" and seen["openai.init"]["max_retries"] == 2
     assert seen["openai.call"]["model"] == "deepseek-flash"
@@ -210,15 +253,15 @@ if __name__ == "__main__":
         "system", "user", "assistant", "user"]
     assert seen["openai.init"]["base_url"] is None  # 空 base_url = 用 SDK 默认地址
 
-    # Anthropic：system 单独传，思考是协议自带参数，开了必须 temperature=1 且 max_tokens 装得下预算
+    # Anthropic：system 单独传，思考是协议自带参数；Messages.create 不再收 temperature
     assert chat("anthropic", "https://api.anthropic.com", "sk-an", "claude-x", "S", ["U"],
                 temperature=1.2, max_tokens=400) == "嗯"
     assert seen["anthropic.call"]["system"] == "S" and "thinking" not in seen["anthropic.call"]
     assert seen["anthropic.call"]["messages"] == [{"role": "user", "content": "U"}]
-    assert seen["anthropic.call"]["temperature"] == 1.2
+    assert "temperature" not in seen["anthropic.call"]
     chat("anthropic", "", "k", "claude-x", "S", ["U"], temperature=1.2, max_tokens=400, thinking=True)
     assert seen["anthropic.call"]["thinking"] == {"type": "enabled", "budget_tokens": _THINK_BUDGET}
-    assert seen["anthropic.call"]["temperature"] == 1.0
+    assert "temperature" not in seen["anthropic.call"]
     assert seen["anthropic.call"]["max_tokens"] > _THINK_BUDGET
 
     # Gemini：助手那一轮叫 model；关思考 = thinking_budget 0，开 = 不传让模型自己定

@@ -1,14 +1,15 @@
 # ASCII only: pip on Chinese Windows decodes this file as GBK and chokes on UTF-8 comments.
 rapidocr-onnxruntime>=1.4,<2  # offline Chinese OCR; 1.2.x rejects det_limit_* ctor args and 1.4.x has no text_detector attr, so pin 1.4; all 1.4.x require Python <3.13 - on 3.13+ pip silently falls back to 1.2.3 (KeyError at startup)
 numpy                         # frames are numpy arrays; chat-area detection is all numpy
-windows-capture               # Windows Graphics Capture, captures GPU-composited windows
+windows-capture; sys_platform == "win32"  # Windows Graphics Capture; Linux uses Mutter ScreenCast via system PyGObject
 PySide6-Fluent-Widgets        # overlay UI (pulls in PySide6)
 pillow                        # only for the synthetic images in probe/
+keyring; sys_platform == "linux"  # GNOME Keyring / Secret Service for the two API keys
 
 # model SDKs: one official client per protocol, no hand-written HTTP (see core/llm.py)
 openai                        # OpenAI Chat Completions: DeepSeek, OpenRouter, Moonshot, GLM, Qwen, ...
 typesafe-sdk                  # Jev judging over TypeSafe direct (api.typesafe.ai)
-anthropic                     # Anthropic Messages
+anthropic>=1.8                # Anthropic Messages；1.8 起 create() 无 temperature
 google-genai                  # Google Gemini
 
 # optional, only for the two old UIA probes (already disproved; install to reproduce)

@@ -3,20 +3,25 @@
 冒出新的对方消息才调 engine → 悬浮窗给 3 条候选 → 人点「填入」。发送永远手动。静默期零调用。
 上下文、结果、聊天记录都按会话名（子进程 OCR 头部标题得来）分开存，切会话不串味。
 
-    pip install rapidocr-onnxruntime numpy windows-capture PySide6-Fluent-Widgets
+    pip install -r requirements.txt
+    python main.py
 两个模型（判断 Jev / 起草语言模型）的来源和 key 在独立设置页填写，不用改代码。IDE 里直接 Run。
+Linux 见 README「Ubuntu / Linux」：./start.sh
 """
 import ctypes
 import multiprocessing
 import queue
+import sys
 import threading
+import time
 import traceback
 from collections import deque
 
-from app import settings, update, worker
-from app.capture import find_wechat_hwnd
+from app import instance, settings, update, worker
+from app.capture import LOCKED_STATUS, find_wechat_hwnd
+from app.ocr import similar
 from app.fill import fill
-from app.overlay import Overlay
+from app.overlay import Overlay, prepare_qt_app
 from app.version import VERSION
 from core.engine import analyze
 
@@ -48,10 +53,6 @@ def fill_reply(text):
         raise RuntimeError("未找到微信窗口，请确认微信已打开")
     if state["area"] is None:
         raise RuntimeError("微信输入区域尚不可用，请确认微信聊天窗口可见（不要最小化）")
-    if settings.reply_target() and ov.at_prefix_enabled():
-        target = target_of(ov.current_chat())  # 填进去的是界面上正看着的那个会话的对象
-        if target:
-            text = f"@{target} " + text  # 纯文本，微信不认成真正的 @，只是让群里看得出在跟谁说
     fill(state["hwnd"], state["area"], text)
 
 
@@ -133,6 +134,8 @@ def start_analyze(title, msgs):
         ov.set_status(f"起草来源 {settings.draft_provider_name()} 没填密钥，去设置里补上", "warning")
         return
     state["busy"] = True
+    state["busy_since"] = time.monotonic()
+    state["analyzing_her"] = next((m[1] for m in reversed(msgs) if m[0] == "her"), None)
     ov.set_busy(True)
     reply_to = target_of(title) if settings.reply_target() else None  # 开关关着就是今天的行为
     threading.Thread(target=analyze_bg, args=(msgs, title, chat_of(title)["rev"], reply_to),
@@ -164,6 +167,9 @@ def drain():
         kind = msg[0]
         if kind == "area":  # 只是窗口挪了位置，坐标跟着更新，别的什么都不用动
             state["area"] = msg[1]
+            continue
+        if kind == "geom":  # Linux：窗口逻辑坐标 + HiDPI scale，填入要点的是屏幕坐标
+            state["hwnd"] = msg[1]
             continue
         if kind == "chat":  # 微信切了会话，界面跟过去（用户正浏览别的会话时也跟，微信是准的）
             state["chat"] = msg[1]
@@ -200,6 +206,10 @@ def drain():
         _, title, new, area = msg
         state["area"] = area
         chat = chat_of(title)
+        new = [(who, name, text) for who, name, text in new
+               if not any(h[0] == who and similar(h[1], text) for h in chat["history"])]
+        if not new:
+            continue
         chat["rev"] += 1  # 这个会话有新消息了，它在跑的分析作废
         if title == ov.current_chat():  # 看的是别的会话就别把人家的候选划掉
             ov.invalidate_replies()
@@ -230,17 +240,16 @@ def tick():
         while not update_result.empty():
             latest, url = update_result.get()
             ov.set_update(latest, url)
+        if state["busy"] and time.monotonic() - state.get("busy_since", 0) > 120:
+            state["busy"] = False
+            state["rerun"] = None
+            ov.set_busy(False)
+            ov.set_status("生成超时，多半是网络或模型太慢。打开采集后等下一条会重试。", "error")
         while not results.empty():
             kind, r, title, revision = results.get()
+            rerun, state["rerun"] = state["rerun"], None
             state["busy"] = False
-            if state["rerun"]:  # 分析期间又来了新消息，接着跑最新的
-                (t, msgs), state["rerun"] = state["rerun"], None
-                start_analyze(t, msgs)
-                continue
-            if revision != chat_of(title)["rev"]:  # 这个会话后来又说话了，这份结果过期了
-                ov.set_busy(False)
-                continue
-            if kind == "ok":
+            if kind == "ok" and r and r.get("candidates"):
                 chat_of(title)["result"] = r  # 先存着；正看着这个会话才立刻贴上去
                 if title == ov.current_chat():
                     ov.show(r)
@@ -248,8 +257,18 @@ def tick():
                     ov.set_busy(False)
             else:
                 ov.set_busy(False)
-                ov.set_status("生成失败，请检查网络和服务设置；新消息到来后会重试。", "error")
-                ov.log(r)
+                if kind != "ok":
+                    hint = str(r).strip() or "生成失败，请检查网络和服务设置"
+                    ov.set_status(hint[:160] + ("…" if len(hint) > 160 else "")
+                                  + "；新消息到来后会重试。", "error")
+                    ov.log(r)
+            if rerun:
+                t, msgs = rerun
+                last = next((m[1] for m in reversed(msgs) if m[0] == "her"), None)
+                prev = state.get("analyzing_her")
+                if last and prev and similar(last, prev):
+                    continue
+                start_analyze(t, msgs)
     except Exception:
         traceback.print_exc()  # 一帧出错不退出
     ov.after(50, tick)
@@ -257,13 +276,22 @@ def tick():
 
 if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本文件，没这行就无限套娃开进程
     multiprocessing.freeze_support()  # 打包成 exe 后 spawn 出来的子进程会重跑一遍 exe，没这行就无限弹界面
-    ctypes.windll.user32.SetProcessDPIAware()
+    try:
+        multiprocessing.set_start_method("spawn")
+    except RuntimeError:
+        pass  # 已经设过就别管
+    if sys.platform == "win32":
+        ctypes.windll.user32.SetProcessDPIAware()
+    prepare_qt_app()
+    if instance.ping_existing():
+        sys.exit(0)
     q = multiprocessing.Queue()
     capture_on = multiprocessing.Event()  # 父子进程共用的开关，置位=采集
     debug_on = multiprocessing.Event()  # 同上，置位=子进程往队列里送整帧给调试窗
     ov = Overlay(on_fill=fill_reply, on_toggle_capture=on_toggle_capture,
                  on_target_change=on_target_change, on_toggle_debug=set_debug,
                  result_of=lambda t: chats.get(t, {}).get("result"))
+    ov._raise_server = instance.listen(ov.present)
     child = dbg = None
     try:
         state["hwnd"] = find_wechat_hwnd()
@@ -272,6 +300,8 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     else:
         capture_on.set()
         child = spawn_worker()
+        if isinstance(state["hwnd"], dict) and state["hwnd"].get("locked"):
+            ov.set_status(LOCKED_STATUS, "warning")
     if settings.debug_view():  # 上次开着就直接开回来
         set_debug(True)
     if not settings.has_jev_key():

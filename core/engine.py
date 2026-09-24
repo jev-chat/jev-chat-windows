@@ -24,7 +24,7 @@ def _add_usage(total: dict, one: dict | None) -> None:
 
 
 def analyze(messages: list, relationship: str, model: str | None = None,
-            timeout: float = 30, context: int = 10, provider: str = "deepseek",
+            timeout: float = 60, context: int = 10, provider: str = "deepseek",
             base_url: str | None = None, reply_to: str | None = None, style: str = "",
             thinking: bool = False, jev_provider: str = "openrouter",
             jev_model: str | None = None) -> dict:

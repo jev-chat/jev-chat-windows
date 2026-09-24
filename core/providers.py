@@ -57,6 +57,8 @@ DRAFT_PROVIDERS = {  # 第一个就是默认：DeepSeek 官网直连
     "dashscope": _Draft("通义千问", "openai",
                         "https://dashscope.aliyuncs.com/compatible-mode/v1", "", _NONE),
     "siliconflow": _Draft("硅基流动", "openai", "https://api.siliconflow.cn/v1", "", _NONE),
+    "stepfun": _Draft("阶跃星辰 StepFun", "openai", "https://api.stepfun.com/v1", "step-3.5-flash",
+                      lambda on: {"reasoning_effort": "high" if on else "low"}),
     "opencode": _Draft("OpenCode Go", "openai", "https://opencode.ai/zen/go/v1",
                        "deepseek-v4.1-flash", _NONE, _OPENCODE_HEADERS, _opencode_chat),
     "anthropic": _Draft("Anthropic", "anthropic", "https://api.anthropic.com", "", _NONE),
@@ -68,7 +70,7 @@ DRAFT_PROVIDERS = {  # 第一个就是默认：DeepSeek 官网直连
 # 这两个来源没有固定地址，设置页要多露一行 Base URL 出来
 CUSTOM = ("custom_openai", "custom_anthropic")
 # 起草时认思考开关的来源，设置页那句提示照着这里写
-THINKING = ("DeepSeek", "OpenRouter", "Anthropic", "Gemini")
+THINKING = ("DeepSeek", "OpenRouter", "Anthropic", "Gemini", "阶跃星辰")
 # 所有可能存 key 的环境变量（新两把 + 两个老名字），脱敏时一次全过一遍（jev_client.redact_secrets）
 ENV_VARS = sorted({JEV_ENV, LLM_ENV, *LEGACY.values()})
 
@@ -84,6 +86,8 @@ if __name__ == "__main__":
     assert DRAFT_PROVIDERS["deepseek"].extra(False) == {"thinking": {"type": "disabled"}}
     assert DRAFT_PROVIDERS["openrouter"].extra(True) == {"reasoning": {"enabled": True}}
     assert DRAFT_PROVIDERS["moonshot"].extra(True) == {}
+    assert DRAFT_PROVIDERS["stepfun"].base.endswith("/v1")
+    assert DRAFT_PROVIDERS["stepfun"].extra(False) == {"reasoning_effort": "low"}
     assert DRAFT_PROVIDERS["deepseek"].headers is None and DRAFT_PROVIDERS["deepseek"].keep is None
     go = DRAFT_PROVIDERS["opencode"]
     assert go.protocol == "openai" and go.base == "https://opencode.ai/zen/go/v1"

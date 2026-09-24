@@ -24,7 +24,8 @@ PySide6-Fluent-Widgets，该组件是 GPLv3 协议，非商用免费，商用需
 | PySide6-Fluent-Widgets | GPLv3 | 非商用免费；商用需向 https://qfluentwidgets.com/price 购买商业授权（作者原话："Non-commercial usage is licensed under GPLv3. For commercial purposes, please purchase commercial license."） |
 | PySide6 | LGPL-3.0 | Qt for Python 官方绑定 |
 | RapidOCR (rapidocr-onnxruntime) | Apache-2.0 | 离线中文 OCR |
-| windows-capture | MIT | Windows Graphics Capture 的 Python 绑定 |
+| windows-capture | MIT | Windows Graphics Capture 的 Python 绑定（仅 Windows） |
+| keyring | MIT | Linux 上两把 API key 走 Secret Service / GNOME Keyring |
 | openai | Apache-2.0 | OpenAI 官方 SDK，起草走 OpenAI 协议时使用 |
 | anthropic | MIT | Anthropic 官方 SDK |
 | google-genai | Apache-2.0 | Google Gemini 官方 SDK |

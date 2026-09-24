@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """设置持久化。key 硬约束（docs/KICKOFF.md #6）：只进环境变量，绝不落文件；其余设置落 config.json。
 
-key 的持久化走 Windows 用户环境变量（注册表 HKCU\\Environment，跟 setx 写的是同一个地方）。
-全程只有两把：判断 JEV_API_KEY、起草 LLM_API_KEY，跟选哪家来源无关。
-读的时候先看进程环境，没有就直接读注册表——IDE 启动时把环境快照拿走了，之后再 Run 继承的还是旧环境，
-只靠 os.environ 会「保存了下次打开还是没有」。"""
+key 的持久化：Windows 走用户环境变量（注册表 HKCU\\Environment，跟 setx 写的是同一个地方）；
+Linux 走 Secret Service / GNOME Keyring（服务名 jev-chat-windows）。全程只有两把：判断
+JEV_API_KEY、起草 LLM_API_KEY，跟选哪家来源无关。读的时候先看进程环境，没有再读系统密钥槽——
+IDE 启动时把环境快照拿走了，之后再 Run 继承的还是旧环境，只靠 os.environ 会「保存了下次打开还是没有」。"""
 from __future__ import annotations
 
 import ctypes
@@ -88,8 +88,36 @@ def debug_view() -> bool:
     """调试视图：另开一个窗口实时画识别框。默认关，开了子进程才往队列里送帧。"""
     return bool(_read("debug_view", False))
 
+_KEYRING_SERVICE = "jev-chat-windows"
+
+
+def _read_keyring(env_name: str) -> str:
+    """Linux：GNOME Keyring / Secret Service，不把 key 写进 config.json。"""
+    try:
+        import keyring
+
+        return (keyring.get_password(_KEYRING_SERVICE, env_name) or "").strip()
+    except Exception:
+        return ""
+
+
+def _write_keyring(env_name: str, value: str) -> None:
+    try:
+        import keyring
+
+        if value:
+            keyring.set_password(_KEYRING_SERVICE, env_name, value)
+        else:
+            try:
+                keyring.delete_password(_KEYRING_SERVICE, env_name)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _read_env(env_name: str) -> str:
-    """进程环境优先；没有就读注册表并带进进程环境，之后 core/ 里按 os.environ 读就有了。"""
+    """进程环境优先；没有就读注册表（Windows）或钥匙串（Linux）并带进进程环境。"""
     v = os.environ.get(env_name, "").strip()
     if not v:
         try:
@@ -98,7 +126,7 @@ def _read_env(env_name: str) -> str:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as k:
                 v = str(winreg.QueryValueEx(k, env_name)[0]).strip()
         except Exception:  # 非 Windows / 没这个值
-            v = ""
+            v = _read_keyring(env_name)
         if v:
             os.environ[env_name] = v
     return v
@@ -108,7 +136,7 @@ def _get_key(env_name: str) -> str:
     return _read_env(env_name) or _read_env(LEGACY[env_name])
 
 def _set_key(env_name: str, value: str) -> None:
-    """只写进程环境 + HKCU\\Environment，不写任何文件。"""
+    """只写进程环境 + 系统密钥槽（Windows 注册表 / Linux 钥匙串），不写任何文件。"""
     os.environ[env_name] = value
     try:
         import winreg
@@ -118,7 +146,7 @@ def _set_key(env_name: str, value: str) -> None:
         # 广播一下，之后新开的终端/进程就能看到；已经开着的 IDE 看不到也无所谓，启动时会读注册表
         ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, "Environment", 2, 5000, None)
     except Exception:
-        pass  # 非 Windows（本机 Mac 开发）走不到，忽略
+        _write_keyring(env_name, value)
 
 def jev_key() -> str:
     """判断那把 key，两家来源共用。"""
