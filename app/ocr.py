@@ -91,6 +91,8 @@ class Reader:
         # ponytail: 名字行被 OCR 漏掉时会挂到上一个人头上。
         name, raw = None, []
         for box, text, _ in sorted(res or [], key=lambda r: r[0][0][1]):
+            if "按住鼠标语音输入文字" in text.replace(" ", ""):
+                continue  # 微信「语音输入」模式的固定提示文案，永远不是聊天内容
             kind, bg, h = who_said(chat, box)
             xs, ys = [p[0] for p in box], [p[1] for p in box]
             rect = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))

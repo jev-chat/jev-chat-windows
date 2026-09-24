@@ -76,7 +76,13 @@ def chat_area(full, header_h=60):
     seps = y0 + np.where((band.std(axis=(1, 2)) < 4) & (row[y0:y1] < 0.1))[0]
     seps = [int(s) for i, s in enumerate(seps) if i == 0 or s - seps[i - 1] > 3]
     below = [s for s in seps if s > y0 + 0.45 * (y1 - y0)]
-    y_in = below[0] if below else y1
+    # 微信 4.x 的输入框区没有可靠的分隔线：按「输入框占底部约 9%（最小 120px）」先算保守线
+    # est，只采信不晚于 est 的候选线；seps 为空、或候选线比 est 还靠下（多半是输入框内部的
+    # 干扰线，实测存在 y≈窗口底-22px 这种）时，都回退 est。旧逻辑退回 y1 会把整个输入框区
+    # （提示文字/语音转写/发送按钮/工具条图标）圈进消息区当消息读。
+    est = y1 - max(120, int(0.09 * (y1 - y0)))
+    cand = [s for s in below if s <= est + 4]
+    y_in = cand[0] if cand else est
     above = [s for s in seps if y0 + header_h < s < y_in - 50]
     y_top = above[-1] if above else y0 + header_h
     if x1 - x0 < 100 or y_in - y_top < 40:
