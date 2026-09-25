@@ -17,6 +17,10 @@ except ImportError:
 # Anthropic 开思考模式时的预算：起草三句话用不上更多；max_tokens 必须比它大，下面会兜住
 _THINK_BUDGET = 2048
 
+# Some Gemini models reject thinking_budget=0 with HTTP 400.
+# Cache those model ids and omit thinking_config on later calls.
+_GEMINI_ZERO_THINK_UNSUPPORTED: set[str] = set()
+
 
 def _turns(user_turns: list[str], assistant: str = "assistant") -> list[dict]:
     """[user, assistant, user, …] 交替；第一条和最后一条都是用户。"""
@@ -99,15 +103,64 @@ def _gemini(base_url, api_key, model, system, user_turns, temperature, max_token
             thinking, timeout) -> str:
     try:
         client, types = _gemini_client(base_url, api_key, timeout)
-        config = types.GenerateContentConfig(
-            system_instruction=system, temperature=temperature, max_output_tokens=max_tokens,
-            # thinking_budget=0 才是真的关掉；不传是让模型自己定（等于开着）
-            thinking_config=None if thinking else types.ThinkingConfig(thinking_budget=0))
-        contents = [types.Content(role=m["role"], parts=[types.Part(text=m["content"])])
-                    for m in _turns(user_turns, assistant="model")]  # Gemini 那边助手叫 model
-        resp = client.models.generate_content(model=model, contents=contents, config=config)
+
+        contents = [
+            types.Content(role=m["role"], parts=[types.Part(text=m["content"])])
+            for m in _turns(user_turns, assistant="model")
+        ]
+
+        base_config = {
+            "system_instruction": system,
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+        }
+
+        if thinking or model in _GEMINI_ZERO_THINK_UNSUPPORTED:
+            # Let Gemini choose its supported/default thinking behavior.
+            config = types.GenerateContentConfig(**base_config)
+            resp = client.models.generate_content(
+                model=model, contents=contents, config=config
+            )
+        else:
+            # Prefer explicitly disabling thinking where the model supports it.
+            config_args = dict(base_config)
+            config_args["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+            config = types.GenerateContentConfig(**config_args)
+
+            try:
+                resp = client.models.generate_content(
+                    model=model, contents=contents, config=config
+                )
+            except Exception as first_exc:
+                status = (
+                    getattr(first_exc, "code", None)
+                    or getattr(first_exc, "status_code", None)
+                )
+                detail = str(first_exc)
+
+                # Some Gemini models return 400 INVALID_ARGUMENT for
+                # thinking_budget=0. Retry once without thinking_config.
+                detail_lower = detail.lower()
+                invalid_argument = (
+                    (status == 400 or str(status).upper() == "INVALID_ARGUMENT")
+                    and (
+                        "invalid_argument" in detail_lower
+                        or "invalid argument" in detail_lower
+                    )
+                )
+                if not invalid_argument:
+                    raise
+
+                fallback_config = types.GenerateContentConfig(**base_config)
+                resp = client.models.generate_content(
+                    model=model, contents=contents, config=fallback_config
+                )
+                # Cache only after the compatibility retry succeeds.
+                _GEMINI_ZERO_THINK_UNSUPPORTED.add(model)
+
     except Exception as exc:
         _fail(exc, "起草")
+
     return resp.text or ""
 
 
@@ -232,6 +285,98 @@ if __name__ == "__main__":
     assert seen["gemini.call"]["config"].thinking_config is None
     assert seen["gemini.init"]["http_options"].base_url == "https://my.proxy"
     assert seen["gemini.init"]["http_options"].timeout == 30000  # 毫秒，不是秒
+
+    # gemini-zero-thinking-fallback-regression
+    # A model may reject thinking_budget=0 with 400 INVALID_ARGUMENT.
+    # Retry once without thinking_config, cache only after that retry succeeds,
+    # then skip the known-bad zero-thinking request on later calls.
+    class _Gemini400(Exception):
+        code = 400
+
+    class _Gemini503(Exception):
+        code = 503
+
+    _GEMINI_ZERO_THINK_UNSUPPORTED.clear()
+    fallback_seen = {"configs": []}
+
+    def _fallback_client(**kw):
+        def call(**k):
+            cfg = k["config"]
+            fallback_seen["configs"].append(cfg)
+            tc = getattr(cfg, "thinking_config", None)
+            if tc is not None and getattr(tc, "thinking_budget", None) == 0:
+                raise _Gemini400(
+                    "400 INVALID_ARGUMENT: thinking_budget=0 unsupported"
+                )
+            return _t.SimpleNamespace(text="fallback ok")
+
+        return _t.SimpleNamespace(
+            models=_t.SimpleNamespace(
+                generate_content=call,
+                list=lambda **_: [],
+            )
+        )
+
+    genai.Client = _fallback_client
+
+    assert chat(
+        "gemini", "", "k", "gemini-no-zero-thinking",
+        "S", ["U"], thinking=False
+    ) == "fallback ok"
+
+    assert len(fallback_seen["configs"]) == 2
+    assert (
+        fallback_seen["configs"][0].thinking_config.thinking_budget == 0
+    )
+    assert fallback_seen["configs"][1].thinking_config is None
+    assert "gemini-no-zero-thinking" in _GEMINI_ZERO_THINK_UNSUPPORTED
+
+    # Cached model should go straight to the compatible request next time.
+    assert chat(
+        "gemini", "", "k", "gemini-no-zero-thinking",
+        "S", ["U"], thinking=False
+    ) == "fallback ok"
+
+    assert len(fallback_seen["configs"]) == 3
+    assert fallback_seen["configs"][2].thinking_config is None
+
+    # If the compatibility retry itself fails, do not poison the cache.
+    _GEMINI_ZERO_THINK_UNSUPPORTED.clear()
+    failure_seen = {"calls": 0}
+
+    def _fallback_failure_client(**kw):
+        def call(**k):
+            failure_seen["calls"] += 1
+            if failure_seen["calls"] == 1:
+                raise _Gemini400(
+                    "400 INVALID_ARGUMENT: thinking_budget=0 unsupported"
+                )
+            raise _Gemini503("503 UNAVAILABLE")
+
+        return _t.SimpleNamespace(
+            models=_t.SimpleNamespace(
+                generate_content=call,
+                list=lambda **_: [],
+            )
+        )
+
+    genai.Client = _fallback_failure_client
+
+    try:
+        chat(
+            "gemini", "", "k", "gemini-fallback-fails",
+            "S", ["U"], thinking=False
+        )
+        raise SystemExit("fallback failure should raise")
+    except JevError as e:
+        assert e.status == 503
+
+    assert "gemini-fallback-fails" not in _GEMINI_ZERO_THINK_UNSUPPORTED
+
+    # Restore the normal fake client for the remaining self-tests below.
+    _GEMINI_ZERO_THINK_UNSUPPORTED.clear()
+    genai.Client = _fake("gemini")
+
 
     # 列模型：去重排序；gemini 剥掉 models/ 前缀
     assert list_models("openai", "https://x/v1", "k") == ["a", "b"]
