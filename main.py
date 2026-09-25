@@ -20,6 +20,11 @@ from app.overlay import Overlay
 from app.version import VERSION
 from core.engine import analyze
 
+try:  # 管线扩展插件（可选）：把 core.hooks 的空钩子换成实现；没这个包就全走原版行为
+    from core.strategy import install as _hooks_install
+except ImportError:  # 没这个包 = 纯上游
+    _hooks_install = None
+
 # {会话名: {history, result, rev, target, senders}}：每个会话各自的上下文、上次结果和版本号，互不串味
 # history 里是 [(who, text, name)]，engine 只认 her/me，name 是群里的发言人（单聊/自己说的是 None）；
 # 只是缓冲区，实际喂模型几条由设置里的「参考上下文」决定
@@ -112,7 +117,8 @@ def analyze_bg(msgs, title, revision, reply_to=None):
                                    reply_to=reply_to, style=settings.style(),
                                    thinking=settings.thinking(),
                                    jev_provider=settings.jev_provider(),
-                                   jev_model=settings.jev_model() or None),
+                                   jev_model=settings.jev_model() or None,
+                                   chat_key=title),
                      title, revision))
     except Exception as e:
         results.put(("err", f"分析失败: {e}", title, revision))
@@ -265,6 +271,8 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
                  on_target_change=on_target_change, on_toggle_debug=set_debug,
                  result_of=lambda t: chats.get(t, {}).get("result"))
     child = dbg = None
+    if _hooks_install is not None:
+        _hooks_install()  # 幂等；插件自己降级，装不上也不挡正常回复
     try:
         state["hwnd"] = find_wechat_hwnd()
     except RuntimeError:

@@ -6,15 +6,30 @@
 from __future__ import annotations
 
 try:
+    from . import hooks
     from .draft import draft_candidates
     from .jev_client import JevError, ask
     from .questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
 except ImportError:
+    try:
+        import hooks
+    except ImportError:
+        hooks = None  # 钩子文件缺失（旧版升级/打包裁剪）时全部跳过，行为与原版一致
     from draft import draft_candidates
     from jev_client import JevError, ask
     from questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
 
 _REPLY_IDX = {"reply_a": 0, "reply_b": 1, "reply_c": 2}
+
+
+def _hook(name, *args, **kwargs):
+    """调用一个钩子；钩子抛异常 = 该项增强失效，主流程继续（别让插件挡住正常回复）。"""
+    if hooks is None:
+        return None
+    try:
+        return getattr(hooks, name)(*args, **kwargs)
+    except Exception:
+        return None
 
 
 def _add_usage(total: dict, one: dict | None) -> None:
@@ -27,7 +42,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             timeout: float = 30, context: int = 10, provider: str = "deepseek",
             base_url: str | None = None, reply_to: str | None = None, style: str = "",
             thinking: bool = False, jev_provider: str = "openrouter",
-            jev_model: str | None = None) -> dict:
+            jev_model: str | None = None, chat_key: str | None = None) -> dict:
     """messages: [(from, text)] from ∈ {her, me}，最新一条在最后；
     群聊里可以带第三项 name（说这句话的人），单聊不带。
     context: 起草和判断各看最近多少条消息（用户设置里的「参考上下文」）。
@@ -37,6 +52,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     style: 用户自己描述的说话风格，只影响起草。
     thinking: 起草时是否开思考模式，只影响起草，默认关。
     model / jev_model = None 用该来源的默认模型。
+    chat_key: 会话名（core.hooks 扩展点用；不装插件时完全不用传）。
 
     返回 {candidates, best_index, best_reply, scores, answers, usage, reply_to}。
     scores 是每条候选的胜出概率（0~1），取自 best_reply.probabilities，取不到记 0.0。
@@ -46,11 +62,13 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     判断那次挂了就退回老路：盲起草 + 判断和排序一次问完，行为跟以前一样。usage 是两次之和。
     """
     state = build_state(messages, relationship, keep=context, reply_to=reply_to)
+    state = _hook("enrich_state", state, messages, relationship, chat_key, context=context) or state
     usage: dict = {}
     answers: dict = {}
     judged = False
+    base_questions = _hook("judge_questions") or JUDGE_QUESTIONS
     try:
-        first = ask(state, dict(JUDGE_QUESTIONS), timeout=timeout,
+        first = ask(state, dict(base_questions), timeout=timeout,
                     provider=jev_provider, model=jev_model)
         answers = first.get("answers") or {}
         _add_usage(usage, first.get("usage"))
@@ -58,14 +76,16 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     except JevError:
         pass  # 退回盲起草 + 老的一次合问；错误不打日志（里面可能带请求内容）
 
+    guidance = guidance_text(answers) if judged else None
+    guidance = _hook("augment_guidance", guidance, answers) if judged else guidance
     candidates = draft_candidates(messages, relationship, provider=provider, model=model,
                                   base_url=base_url, timeout=timeout, keep=context,
                                   reply_to=reply_to, style=style, thinking=thinking,
-                                  guidance=guidance_text(answers) if judged else None)
+                                  guidance=guidance)
     if not candidates:  # 注入过滤可以把起草结果全扔掉；接着取 [0] 会 IndexError
         raise JevError("起草结果没有可用候选回复")
 
-    questions = {} if judged else dict(JUDGE_QUESTIONS)
+    questions = {} if judged else dict(base_questions)
     if len(candidates) >= 2:  # 起草只给了 1 条就没什么可排的，判断题照问
         questions.update(build_rank_question(candidates))
     if questions:
@@ -92,7 +112,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
         except (TypeError, ValueError):
             scores[idx] = 0.0  # 脏数据一律按 0 处理
 
-    return {
+    result = {
         "candidates": candidates,
         "best_index": best_index,
         "best_reply": candidates[best_index],
@@ -101,6 +121,10 @@ def analyze(messages: list, relationship: str, model: str | None = None,
         "usage": usage,
         "reply_to": reply_to,
     }
+    return _hook("after_analyze", result, state=state, answers=answers, judged=judged,
+                 messages=messages, relationship=relationship, context=context,
+                 timeout=timeout, chat_key=chat_key,
+                 jev_provider=jev_provider, jev_model=jev_model) or result
 
 
 if __name__ == "__main__":
