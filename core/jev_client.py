@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Jev 判断 API 客户端：OpenRouter 或 TypeSafe 直连。
+"""Jev 判断客户端：OpenRouter、TypeSafe 直连，或本地 Laya。
 
 TypeSafe 直连走官方 `typesafe_sdk`；OpenRouter 这条是唯一自己拼 HTTP 的路——
 SDK 把路径写死成 `/v1/systemone`，打不到 OpenRouter 的 `/api/alpha/decisions`。
-两条路返回同一个 dict 形状，engine 不关心跑的是哪条。key 只从环境变量读，绝不打进日志。
+Laya 是本地决策模型，不进网络、不要 key，首次使用会下权重。
+三条路返回同一个 dict 形状，engine 不关心跑的是哪条。key 只从环境变量读，绝不打进日志。
 """
 
 from __future__ import annotations
@@ -17,11 +18,11 @@ import urllib.request
 from typing import NoReturn
 
 try:  # 当模块导入 / 当脚本直接跑 都能用
-    from .providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY,
-                            OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
+    from .providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LAYA_CHECKPOINTS, LAYA_REPO,
+                            LEGACY, OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
 except ImportError:
-    from providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY,
-                           OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
+    from providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LAYA_CHECKPOINTS, LAYA_REPO,
+                           LEGACY, OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
 
 MAX_RETRIES = 3
 
@@ -89,12 +90,15 @@ def ask(state: dict, questions: dict, timeout: float = 20,
         provider: str = "openrouter", model: str | None = None) -> dict:
     """问 Jev 一轮判断，返回 {"answers": {名字: 答案}, "usage": {...}}。
 
-    provider ∈ JEV_PROVIDERS（openrouter / typesafe 直连）；model=None 用该来源的默认模型。
-    两条路返回的 dict 形状一模一样，429/529 都会退避重试。绝不打印或写出 key。
+    provider ∈ JEV_PROVIDERS（openrouter / typesafe 直连 / laya 本地）；model=None 用该来源的默认模型。
+    在线两条返回的 dict 形状一模一样，429/529 都会退避重试；laya 本地不要 key、不进网络。
+    绝不打印或写出 key。
     """
     spec = JEV_PROVIDERS.get(provider) or JEV_PROVIDERS["openrouter"]
-    key = _api_key(JEV_ENV)  # 两家共用同一把 key，换来源不用重填
     model = model or spec.default
+    if provider == "laya":
+        return _ask_laya(state, questions, model)
+    key = _api_key(JEV_ENV)  # 两家共用同一把 key，换来源不用重填
     if provider == "typesafe":
         return _ask_typesafe(state, questions, key, model, timeout)
     return _ask_openrouter(state, questions, key, model, timeout)
@@ -110,6 +114,32 @@ def _answer(answer) -> dict:
     # score：SDK 把概率的 key 转成了 int，这里转回字符串，跟 JSON 那条路对齐
     return {"type": "score", "score": answer.score, "confidence": answer.confidence,
             "probabilities": {str(k): v for k, v in answer.probabilities.items()}}
+
+
+_laya_agents: dict = {}  # checkpoint → 已加载的 agent；加载一次要几秒，别每题都重来
+
+
+def _ask_laya(state: dict, questions: dict, model: str) -> dict:
+    """本地 Laya 决策模型（convaiinnovations/laya）：不进网络、不要 key。
+
+    第一次用会下 ~1.4GB 权重到 HuggingFace 缓存，之后按 checkpoint 复用进程内的 agent。
+    `agent.predict(state, questions)` 的返回形状跟在线两条路对齐，这里只透出 answers。
+    Laya 不报 usage，usage 记空 dict（engine 的 _add_usage 认这个）。
+    """
+    try:
+        import laya
+    except ImportError:
+        raise JevError(
+            "未安装 laya，本地判断需要它：pip install laya（首次会下载约 1.4GB 权重）"
+        ) from None
+    try:
+        agent = _laya_agents.get(model)
+        if agent is None:
+            agent = _laya_agents[model] = laya.load(LAYA_REPO, subfolder=model)
+        result = agent.predict(state, questions)
+    except Exception as exc:
+        _fail(exc, "Laya 判断")
+    return {"answers": result.get("answers") or {}, "usage": {}}
 
 
 def _ask_typesafe(state: dict, questions: dict, key: str, model: str, timeout: float) -> dict:
@@ -205,6 +235,8 @@ def _check_openrouter_key(key: str, timeout: float) -> None:
 
 def list_models(provider: str, key: str, timeout: float = 10) -> list[str]:
     """某家能用的 Jev 模型 id，去重排序。失败抛 JevError（设置页直接显示这句话）。"""
+    if provider == "laya":
+        return list(LAYA_CHECKPOINTS)  # 本地 checkpoint 写死：没有列表端点，也不用 key
     if provider == "typesafe":
         import typesafe_sdk
 
@@ -352,4 +384,36 @@ if __name__ == "__main__":
             assert "HTTP 429" in str(e) and "rate limited" in str(e)
 
     assert redact_secrets("key=ts-key or-key") == "key=[REDACTED] [REDACTED]"
+
+    # Laya 本地：不要 key、不进网络。把 laya.load 换成假 agent，验返回形状、agent 复用、缺依赖的提示
+    import sys as _sys
+    import types as _types
+
+    loads: list = []
+
+    class _FakeLayaAgent:
+        def predict(self, state, qs):
+            return {"answers": {"best_reply": {"type": "choice", "choice": "reply_a",
+                                               "confidence": 0.6,
+                                               "probabilities": {"reply_a": 0.6, "reply_b": 0.4}}}}
+
+    _fake_laya = _types.ModuleType("laya")
+    _fake_laya.load = lambda repo, subfolder=None: (loads.append((repo, subfolder)),
+                                                    _FakeLayaAgent())[1]
+    os.environ.pop(JEV_ENV, None)  # 本地来源不读 key，没设也该跑通
+    os.environ.pop("OPENROUTER_API_KEY", None)
+    with patch.dict(_sys.modules, {"laya": _fake_laya}):
+        got = ask({"chat": {}}, questions, provider="laya")
+        ask({"chat": {}}, questions, provider="laya")  # 同一个 checkpoint：复用 agent，不再 load
+        ask({"chat": {}}, questions, provider="laya", model="typed-decisions")
+    assert got["answers"]["best_reply"]["choice"] == "reply_a" and got["usage"] == {}
+    assert loads == [(LAYA_REPO, "multilingual"), (LAYA_REPO, "typed-decisions")]
+    assert list_models("laya", "") == ["multilingual", "typed-decisions"]
+    # 没装 laya 时给一句人话，不是 ImportError 堆栈
+    with patch.dict(_sys.modules, {"laya": None}):
+        try:
+            ask({"chat": {}}, questions, provider="laya")
+            raise SystemExit("应当抛错")
+        except JevError as e:
+            assert "pip install laya" in str(e)
     print("jev_client ok")

@@ -33,6 +33,9 @@ for pkg in (
     binaries += b
     hiddenimports += h
 
+# Laya（可选的本地判断来源，core/jev_client._ask_laya 里函数内 import）故意不收：官方发布包不带它，
+# 要用的人自己 `pip install laya` 后照上面同样方式 collect_all("laya") 加进来，别塞进默认发布包。
+
 excludes = [
     # 确认没人用：rapidocr 只 import 了 cv2 / PIL / yaml / pyclipper / shapely（PIL 千万别排，读图要它）
     "tkinter", "matplotlib", "scipy", "pandas",

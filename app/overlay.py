@@ -573,7 +573,8 @@ class Overlay:
         self._fetched.done.connect(self._models_fetched)
         self.jev = self._model_group(box, "判断 · Jev", "jev", providers.JEV_PROVIDERS)
         box.addWidget(self._hint(
-            "判断意图、紧张度，并给三条候选排序。两家给的是同一个 Jev，必填。"
+            "判断意图、紧张度，并给三条候选排序。OpenRouter / TypeSafe 用同一把 Jev，必填；"
+            "Laya 本地离线判断，不填密钥。"
         ))
         self.draft = self._model_group(box, "起草 · 语言模型", "draft", providers.DRAFT_PROVIDERS)
         box.addWidget(self._hint(
@@ -648,14 +649,16 @@ class Overlay:
             box.addWidget(self.baseEdit)
         key_label = _label("密钥", 13)
         box.addWidget(key_label)
+        group.keyLabel = key_label  # 本地来源（Laya）整行收起，_sync_model_fields 按来源显隐
         group.keyEdit = PasswordLineEdit()
         group.keyEdit.setAccessibleName(f"{title} API 密钥")
         key_label.setBuddy(group.keyEdit)
         group.keyEdit.returnPressed.connect(self._save)
         box.addWidget(group.keyEdit)
-        box.addWidget(self._hint(
+        group.keyHint = self._hint(
             "OpenRouter 的 key 或 TypeSafe 的 key，看上面选的来源。" if kind == "jev"
-            else "上面选哪家就填哪家的 key；换来源重填一次，只存这一把。"))
+            else "上面选哪家就填哪家的 key；换来源重填一次，只存这一把。")
+        box.addWidget(group.keyHint)
         model_label = _label("模型", 13)
         box.addWidget(model_label)
         row = QHBoxLayout()
@@ -696,8 +699,15 @@ class Overlay:
         for group in (self.jev, self.draft):
             provider = self._provider_of(group)
             name = group.table[provider].name
+            local = provider in providers.LOCAL_JEV  # 本地来源不要 key，密钥那一行整行收起
             configured = bool(group.stored_key())
-            group.keyState.setText("已配置" if configured else "未配置")
+            group.keyState.setText("本地模型" if local else ("已配置" if configured else "未配置"))
+            group.keyLabel.setVisible(not local)
+            group.keyEdit.setVisible(not local)
+            group.keyHint.setText(
+                "本地推理，不需要密钥；首次使用会下载约 1.4GB 权重。" if local else
+                ("OpenRouter 的 key 或 TypeSafe 的 key，看上面选的来源。" if group.kind == "jev"
+                 else "上面选哪家就填哪家的 key；换来源重填一次，只存这一把。"))
             group.keyEdit.setPlaceholderText(
                 "已配置，留空保留" if configured else f"输入 {name} API 密钥")
             if self._compact:
@@ -708,12 +718,14 @@ class Overlay:
         self.baseEdit.setVisible(custom)
 
     def _fetch_models(self, group):
-        """「获取模型」：拿填的 key（没填就拿存的）去问接口，网络调用丢后台线程。"""
+        """「获取模型」：拿填的 key（没填就拿存的）去问接口，网络调用丢后台线程。
+        本地来源（Laya）不要 key，列表写死在 core.providers 里。"""
         provider = self._provider_of(group)
+        local = provider in providers.LOCAL_JEV
         custom = group.kind == "draft" and provider in providers.CUSTOM
         base = self.baseEdit.text().strip() if custom else None
         key = group.keyEdit.text().strip() or group.stored_key()
-        if not key:
+        if not key and not local:
             group.status.setText("先填密钥")
             return
         if custom and not base:
@@ -799,7 +811,8 @@ class Overlay:
             return
         for group, provider in ((self.jev, jev_provider), (self.draft, draft_provider)):
             name = group.table[provider].name
-            if not group.keyEdit.text().strip() and not group.stored_key():
+            local = provider in providers.LOCAL_JEV  # 本地来源不要 key，跳过密钥校验
+            if not local and not group.keyEdit.text().strip() and not group.stored_key():
                 self._settings_feedback(f"请先填写 {group.keyTitle} 的 API 密钥。", error=True)
                 group.keyEdit.setFocus()
                 return

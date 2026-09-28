@@ -14,3 +14,6 @@ google-genai                  # Google Gemini
 # optional, only for the two old UIA probes (already disproved; install to reproduce)
 # uiautomation                # probe_win.py / probe_win2.py
 # winsdk                      # probe_notify.py
+
+# optional, only for the local Laya judging source (offline, no API key; ~1.4GB weights on first use)
+laya
