@@ -5,7 +5,7 @@
 key 一律由调用方从环境变量/注册表取了再传进来。协议具体怎么调见 core/llm.py。
 
 全程只有两把 key：判断一把 JEV_API_KEY、起草一把 LLM_API_KEY，跟选哪家来源无关，
-换来源就是换同一个槽里的值。
+换来源就是换同一个槽里的值。Laya 是本地推理，两把 key 都不碰。
 """
 from __future__ import annotations
 
@@ -24,11 +24,21 @@ LLM_ENV = "LLM_API_KEY"    # 起草那把，不管选哪家语言模型
 # 迁移：老版本按来源各存一个变量。新变量空着、老变量有值就先用老的（保存时抄进新的）
 LEGACY = {JEV_ENV: "OPENROUTER_API_KEY", LLM_ENV: "DEEPSEEK_API_KEY"}
 
+# Laya：本地决策模型（HuggingFace 上的 convaiinnovations/laya），不进网络、不要 key。
+# subfolder 就是它的 checkpoint，当前只有 multilingual 吃中文；probe/probe_laya*.py 的结论是
+# 判断不如 Jev 稳，但离线、零 token，当作不想出网时的备选。
+LAYA_REPO = "convaiinnovations/laya"
+LAYA_CHECKPOINTS = ("multilingual", "typed-decisions")
+
+# Jev 判断的 model 字段：在线来源是模型 id，Laya 是上面的 checkpoint 名。
 _Jev = namedtuple("_Jev", "name default")
 JEV_PROVIDERS = {
     "openrouter": _Jev("OpenRouter", "typesafe/jev-1.13"),
     "typesafe": _Jev("TypeSafe 直连", "jev-latest"),
+    "laya": _Jev("Laya 本地", LAYA_CHECKPOINTS[0]),
 }
+# 不要 key 的判断来源（本地推理）：设置页收起密钥那一行，保存和触发也不校验 key
+LOCAL_JEV = ("laya",)
 
 # protocol ∈ {openai, anthropic, gemini}：决定 core/llm.py 用哪个官方 SDK
 # base 空 = 用 SDK 自带的默认地址（gemini），或者等用户自己填（自定义来源）
@@ -95,4 +105,8 @@ if __name__ == "__main__":
         "minimax-m3", "qwen3.8-max", "grok-4.7", "gpt-6-luna", "muse-spark-1.2-contributor"))
     # 全程只有两把 key，脱敏还得管老名字
     assert ENV_VARS == ["DEEPSEEK_API_KEY", "JEV_API_KEY", "LLM_API_KEY", "OPENROUTER_API_KEY"]
+    # Laya 本地：默认 checkpoint 得在表里，LOCAL_JEV 只圈住它一个，其余两条仍要 key
+    assert JEV_PROVIDERS["laya"].default == LAYA_CHECKPOINTS[0] == "multilingual"
+    assert LOCAL_JEV == ("laya",) and all(k in JEV_PROVIDERS for k in LOCAL_JEV)
+    assert set(JEV_PROVIDERS) - set(LOCAL_JEV) == {"openrouter", "typesafe"}
     print("providers ok")

@@ -12,7 +12,8 @@ import json
 import os
 import sys  # 只为下面这一处：打包后 __file__ 指向临时解包目录，config.json 得放在 exe 旁边才存得住
 
-from core.providers import CUSTOM, DRAFT_PROVIDERS, JEV_ENV, JEV_PROVIDERS, LEGACY, LLM_ENV
+from core.providers import (CUSTOM, DRAFT_PROVIDERS, JEV_ENV, JEV_PROVIDERS, LEGACY, LLM_ENV,
+                            LOCAL_JEV)
 
 _ROOT = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
          else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -48,7 +49,7 @@ def style() -> str:
     return str(_read("style") or "")
 
 def jev_provider() -> str:
-    """判断模型走哪家：openrouter（默认）或 typesafe 直连。"""
+    """判断模型走哪家：openrouter（默认）、typesafe 直连，或 laya 本地。"""
     v = _read("jev_provider")
     return v if v in JEV_PROVIDERS else _DEFAULT_JEV
 
@@ -136,7 +137,8 @@ def jev_key() -> str:
     return _get_key(JEV_ENV)
 
 def has_jev_key() -> bool:
-    return bool(jev_key())
+    """判断这一节配好了没。Laya 是本地推理、不要 key，选了它就永远算配好。"""
+    return jev_provider() in LOCAL_JEV or bool(jev_key())
 
 def llm_key() -> str:
     """起草那把 key，所有语言模型来源共用。"""

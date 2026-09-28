@@ -41,6 +41,9 @@
 1. **判断 · Jev** —— 判断意图、紧张度，并给三条候选排序。来源选 **OpenRouter**（默认，key 在
    [openrouter.ai](https://openrouter.ai/) 申请）或 **TypeSafe 直连**（key 在
    [console.typesafe.ai](https://console.typesafe.ai/) 申请）。填的是哪家的 key 看你上面选了哪家。
+   也可以选 **Laya 本地**：完全离线、不要 key，首次用会下约 1.4GB 权重；判断不如 Jev 稳（见
+   `probe/probe_laya*.py`），只在不想让聊天内容出网时当备选。**官方 exe 没带 laya**，这个来源要从
+   源码运行或自己打包时才装得上。
 2. **起草 · 语言模型** —— 写那三条候选。默认 **DeepSeek 官网**直连，key 在
    [platform.deepseek.com](https://platform.deepseek.com/) 申请（很便宜，起草一次几厘钱）。
    换别家见下面的表，OpenAI / Anthropic / Gemini 三种接口都支持。
@@ -99,8 +102,9 @@ DeepSeek 官方 API（`api.deepseek.com`）国内直连，起草基本就是一�
 - **调试视图**（可选）：另开一个窗口，实时画出截到的画面和每个识别框——绿 = 我、蓝 = 对方、
   灰 = 过滤掉的灰字、橙 = 当成发言人名、红 = 当成图片丢掉、黄 = 小字丢掉，外加消息区和头部的框、
   OCR 耗时、这一帧读出来的每一行。识别不对时一眼看出是哪一步的锅。只在内存里画，不存图。
-- **两个模型都能换**：判断走 OpenRouter 或 TypeSafe 直连；起草有 12 家预设（默认 DeepSeek 官网），
-  OpenAI / Anthropic / Gemini 三种协议都支持，也能填自己的 Base URL。全程只要两把 key。
+- **两个模型都能换**：判断走 OpenRouter / TypeSafe 直连，或 Laya 本地（离线、不要 key）；起草有 12 家
+  预设（默认 DeepSeek 官网），OpenAI / Anthropic / Gemini 三种协议都支持，也能填自己的 Base URL。
+  在线判断和起草各一把 key，Laya 本地那把不用 key。
 - **思考模式开关**：默认关；开了模型先想再写，更斟酌但慢好几倍、贵一些。
 - **参考上下文条数**：3~30，默认 10，起草和判断都按它取最近 N 条。
 - **说话风格**：一句话描述自己的口吻，补在「照着你最近发的消息模仿」之上。
@@ -132,7 +136,8 @@ DeepSeek 官方 API（`api.deepseek.com`）国内直连，起草基本就是一�
   不夹带任何聊天内容；设置里「启动时检查更新」关掉就完全不发这个请求，源码直接跑（没有版本号）也
   不会发。
 
-什么会出网：判断（`JEV_API_KEY`）去你选的 OpenRouter 或 TypeSafe 直连；起草（`LLM_API_KEY`）发给你
+什么会出网：判断（`JEV_API_KEY`）去你选的 OpenRouter 或 TypeSafe 直连；选 Laya 本地则聊天内容不出网
+（只在首次使用时从 HuggingFace 下一次约 1.4GB 权重，之后离线跑）。起草（`LLM_API_KEY`）发给你
 在设置里选的那家接口（DeepSeek 官网、OpenRouter、OpenAI、Moonshot、智谱、通义、硅基流动、
 OpenCode Go、Anthropic、Gemini，或者自填的 OpenAI 兼容 / Anthropic 兼容地址），加上启动时（可关）一次到
 GitHub 查版本号。**本项目没有任何自建服务器**，聊天内容只在触发分析的那一刻，发给你自己在设置里
@@ -163,12 +168,13 @@ WGC 截聊天窗口（GPU 合成窗口也能截，被遮挡也能截）
 
 ### 模型
 
-**判断 + 排序（key：`JEV_API_KEY`）**
+**判断 + 排序（key：`JEV_API_KEY`；Laya 本地不用 key）**
 
 | 来源 | 地址 | 默认模型 |
 | --- | --- | --- |
 | OpenRouter（默认） | `openrouter.ai/api/alpha/decisions` | `typesafe/jev-1.13` |
 | TypeSafe 直连 | `api.typesafe.ai`（官方 `typesafe-sdk`） | `jev-latest` |
+| Laya 本地（可选） | 本地推理（`convaiinnovations/laya`，离线） | `multilingual` |
 
 **起草 3 条候选（key：`LLM_API_KEY`）**
 
@@ -248,7 +254,8 @@ pip install -r requirements.txt
 python main.py
 ```
 
-PyCharm / VS Code 里直接 Run `main.py` 也行。
+PyCharm / VS Code 里直接 Run `main.py` 也行。想用「判断 · Laya 本地」这个来源再装一份：
+`pip install laya`（首次运行会下约 1.4GB 权重，官方发布包不含它）。
 
 首次启动会自动弹出设置页：填两把 key（判断 `JEV_API_KEY`、起草 `LLM_API_KEY`，见上面「使用说明」），
 选你们的关系（恋人 / 朋友 / 同事 / 家人 / 自定义）。key 写进注册表 `HKCU\Environment`，重启后依然有效，
@@ -279,9 +286,9 @@ pyinstaller --noconfirm --clean jev.spec
 | 群聊指定回复对象 | 开了群聊里才有「回复对象」那一行，候选针对 TA 写 | `config.json` → `reply_target`（默认关） |
 | 启动时检查更新 | 开了才在启动时查一次 GitHub 最新版本号，有新版本就在标题栏下面提示 | `config.json` → `check_update`（默认开） |
 | 调试视图 | 另开一个窗口实时显示截到的画面和识别框，看识别在哪一步认错。拨一下立刻生效，不用点保存；关掉那个窗口等于关掉开关 | `config.json` → `debug_view`（默认关） |
-| 判断 · 来源 | OpenRouter 还是 TypeSafe 直连 | `config.json` → `jev_provider`（默认 `openrouter`） |
-| 判断 · 密钥 | 上面选哪家就填哪家的 key。已配置时留空 = 保留 | 注册表 `HKCU\Environment` → `JEV_API_KEY` |
-| 判断 · 模型 | 可手打，也可点「获取模型」拉列表挑 | `config.json` → `jev_model`（空 = 该来源默认） |
+| 判断 · 来源 | OpenRouter、TypeSafe 直连，或 Laya 本地 | `config.json` → `jev_provider`（默认 `openrouter`） |
+| 判断 · 密钥 | 上面选哪家就填哪家的 key；Laya 本地不要 key，这一行收起。已配置时留空 = 保留 | 注册表 `HKCU\Environment` → `JEV_API_KEY` |
+| 判断 · 模型 | 可手打，也可点「获取模型」拉列表挑；Laya 填的是 checkpoint 名 | `config.json` → `jev_model`（空 = 该来源默认） |
 | 起草 · 来源 | 上面那张表里的任意一家 | `config.json` → `draft_provider`（默认 `deepseek`） |
 | 起草 · Base URL | 只有两个「自定义」来源才出现这一行 | `config.json` → `draft_base_url` |
 | 起草 · 密钥 | 上面选哪家就填哪家的 key。已配置时留空 = 保留 | 注册表 `HKCU\Environment` → `LLM_API_KEY` |
@@ -327,9 +334,9 @@ app/                    UI + 采集层
   settings.py           两把 key 只进注册表，其余设置落 config.json
 core/                   Jev 判断内核，平台无关，跟安卓原版同一套口径
   engine.py             唯一入口 analyze(messages, relationship) → 候选 + 排序 + 判断
-  providers.py          两张来源表（判断 / 起草）：协议、地址、默认模型；纯数据，不认 key
+  providers.py          两张来源表（判断 / 起草）：协议、地址、默认模型；纯数据，不认 key；本地来源单列
   llm.py                三种协议的薄适配层，一律走官方 SDK：openai / anthropic / google-genai
-  jev_client.py         Jev 判断客户端：OpenRouter（urllib）/ TypeSafe 直连（typesafe-sdk）；脱敏、退避
+  jev_client.py         Jev 判断客户端：OpenRouter（urllib）/ TypeSafe 直连（typesafe-sdk）/ Laya 本地；脱敏、退避
   questions.py          7 道判断题 + build_state() + build_rank_question() + 判断小抄 guidance_text() / 中文标签 CHOICE_LABELS
   draft.py              起草 3 条候选：拼提示词、解析、过滤、不足时追问补齐；调用走 llm.py
 tools/
@@ -381,6 +388,11 @@ config.json             你自己的设置，不进仓库（在 .gitignore 里�
 - **没有托盘**：关窗口就是退出（标题栏的「最小化」是收到任务栏，不是后台常驻）。
 
 ## 更新记录
+
+**v0.1.11**
+- 判断来源新增 **Laya 本地**（`convaiinnovations/laya`）：完全离线、不要 key，首次使用下约 1.4GB 权重，
+  设置页选它时收起密钥那一行；判断不如 Jev 稳，只作不想让聊天内容出网时的备选。`pip install laya`
+  后从源码运行或自己打包可用，官方 exe 不含它
 
 **v0.1.10**
 - 先判断再起草（issue #4）：`analyze()` 改成三段式 —— Jev 先答 7 道判断题，判断折成中文小抄喂进
@@ -463,6 +475,7 @@ config.json             你自己的设置，不进仓库（在 .gitignore 里�
 - [RapidOCR](https://github.com/RapidAI/RapidOCR) — 离线中文 OCR
 - [windows-capture](https://github.com/NiiightmareXD/windows-capture) — Windows Graphics Capture 的 Python 绑定
 - [PyQt-Fluent-Widgets](https://github.com/zhiyiYo/PyQt-Fluent-Widgets) — 界面组件
+- [Laya](https://huggingface.co/convaiinnovations/laya) — 本地非自回归决策模型，可选作离线判断来源
 
 ## 版权与许可
 
