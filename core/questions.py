@@ -270,10 +270,12 @@ def build_state(messages: list, relationship: str, keep: int = 10,
         cleaned.append(message)
     cleaned = cleaned[-keep:]
     latest_from = cleaned[-1]["from"] if cleaned else "her"
+    latest_message = cleaned[-1]["text"] if cleaned else ""
     chat = {
         "relationship": relationship,
         "messages": cleaned,
         "latest_from": latest_from,
+        "latest_message": latest_message,
         "is_group": any("name" in m for m in cleaned),
     }
     if reply_to:
@@ -293,6 +295,11 @@ def build_rank_question(candidates: list[str]) -> dict:
                 "Which candidate reply is the most appropriate next message, "
                 "given the conversation and the other person's true need? "
                 "Prefer a reply that matches the best action type. "
+                "Treat chat.latest_message as the hard topical anchor. "
+                "A candidate must directly fit chat.latest_message. "
+                "Do not prefer a candidate that introduces or continues an earlier topic unless "
+                "the latest message explicitly refers to that topic or the connection is necessary "
+                "to understand the latest message. "
                 "Penalize dismissive, over-promising, or off-topic replies. "
                 "If the facts are not yet confirmed, prefer the candidate that looks them up "
                 "instead of faking memory or a vague apology."
