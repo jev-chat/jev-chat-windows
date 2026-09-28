@@ -18,8 +18,11 @@ OPENROUTER_DECISIONS = "https://openrouter.ai/api/alpha/decisions"
 # 免费的密钥探测端点：Jev 模型不在 /models 目录里（列表写死），key 对不对靠它验
 OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/auth/key"
 TYPESAFE_BASE = "https://api.typesafe.ai"
+# jevtypesafeai.com 转卖网关：用它自家发的 jv_live_ key 计量，代调上游 TypeSafe。
+# 响应就是 {model, answers, usage}（answers 与 TypeSafe SDK 同形），无信封要拆。
+JEVTYPESAFEAI_DECISIONS = "https://jevtypesafeai.com/api/v1/decide"
 
-JEV_ENV = "JEV_API_KEY"    # 判断那把，不管选 OpenRouter 还是 TypeSafe
+JEV_ENV = "JEV_API_KEY"    # 判断那把，不管选哪个 Jev 来源
 LLM_ENV = "LLM_API_KEY"    # 起草那把，不管选哪家语言模型
 # 迁移：老版本按来源各存一个变量。新变量空着、老变量有值就先用老的（保存时抄进新的）
 LEGACY = {JEV_ENV: "OPENROUTER_API_KEY", LLM_ENV: "DEEPSEEK_API_KEY"}
@@ -28,6 +31,7 @@ _Jev = namedtuple("_Jev", "name default")
 JEV_PROVIDERS = {
     "openrouter": _Jev("OpenRouter", "typesafe/jev-1.13"),
     "typesafe": _Jev("TypeSafe 直连", "jev-latest"),
+    "jevtypesafeai": _Jev("jevtypesafeai.com", "jev-latest"),
 }
 
 # protocol ∈ {openai, anthropic, gemini}：决定 core/llm.py 用哪个官方 SDK
@@ -93,6 +97,7 @@ if __name__ == "__main__":
     assert go.keep("deepseek-v4.1-flash") and go.keep("glm-5.3") and go.keep("hy3")
     assert not any(go.keep(m) for m in (
         "minimax-m3", "qwen3.8-max", "grok-4.7", "gpt-6-luna", "muse-spark-1.2-contributor"))
+    assert JEV_PROVIDERS["jevtypesafeai"].default == "jev-latest"
     # 全程只有两把 key，脱敏还得管老名字
     assert ENV_VARS == ["DEEPSEEK_API_KEY", "JEV_API_KEY", "LLM_API_KEY", "OPENROUTER_API_KEY"]
     print("providers ok")

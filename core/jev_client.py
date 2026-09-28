@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Jev 判断 API 客户端：OpenRouter 或 TypeSafe 直连。
+"""Jev 判断 API 客户端：OpenRouter、TypeSafe 直连或 jevtypesafeai.com。
 
-TypeSafe 直连走官方 `typesafe_sdk`；OpenRouter 这条是唯一自己拼 HTTP 的路——
-SDK 把路径写死成 `/v1/systemone`，打不到 OpenRouter 的 `/api/alpha/decisions`。
-两条路返回同一个 dict 形状，engine 不关心跑的是哪条。key 只从环境变量读，绝不打进日志。
+TypeSafe 直连走官方 `typesafe_sdk`；OpenRouter 和 jevtypesafeai.com 各自走自己的
+HTTP Decisions endpoint（SDK 把路径写死成 `/v1/systemone`，打不到这两个地址）。
+三条路最终归一化成同一个 dict 形状，engine 不关心跑的是哪条。key 只从环境变量读，绝不打进日志。
 """
 
 from __future__ import annotations
@@ -17,11 +17,11 @@ import urllib.request
 from typing import NoReturn
 
 try:  # 当模块导入 / 当脚本直接跑 都能用
-    from .providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY,
-                            OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
+    from .providers import (ENV_VARS, JEVTYPESAFEAI_DECISIONS, JEV_ENV, JEV_PROVIDERS,
+                            LEGACY, OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
 except ImportError:
-    from providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY,
-                           OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
+    from providers import (ENV_VARS, JEVTYPESAFEAI_DECISIONS, JEV_ENV, JEV_PROVIDERS,
+                           LEGACY, OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
 
 MAX_RETRIES = 3
 
@@ -97,6 +97,8 @@ def ask(state: dict, questions: dict, timeout: float = 20,
     model = model or spec.default
     if provider == "typesafe":
         return _ask_typesafe(state, questions, key, model, timeout)
+    if provider == "jevtypesafeai":
+        return _ask_jevtypesafeai(state, questions, key, model, timeout)
     return _ask_openrouter(state, questions, key, model, timeout)
 
 
@@ -129,6 +131,86 @@ def _ask_typesafe(state: dict, questions: dict, key: str, model: str, timeout: f
         "usage": {"input_tokens": result.usage.input_tokens,
                   "output_tokens": result.usage.output_tokens},
     }
+
+
+def _ask_jevtypesafeai(state: dict, questions: dict, key: str, model: str, timeout: float) -> dict:
+    """jevtypesafeai.com 转卖网关的 /api/v1/decide adapter，手写 urllib。
+
+    网关用它自家发的 jv_live_ key 计量、代调上游 TypeSafe，响应已经是
+    {"model", "answers", "usage"}（answers 与 TypeSafe SDK 同形），直接取 answers/usage，
+    没有信封要拆。429/503/529 退避重试；402=余额不足，报一句人话。
+    """
+    payload = json.dumps(
+        {"model": model, "state": state, "questions": questions},
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    last_status: int | None = None
+    last_body = ""
+    for attempt in range(MAX_RETRIES + 1):
+        req = urllib.request.Request(
+            JEVTYPESAFEAI_DECISIONS,
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json; charset=utf-8",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+                body = json.loads(raw)
+
+            if not isinstance(body, dict):
+                raise JevError("jevtypesafeai response is not a JSON object")
+
+            answers = body.get("answers")
+            if not isinstance(answers, dict):
+                raise JevError("jevtypesafeai response missing answers")
+
+            usage = body.get("usage")
+            return {
+                "answers": answers,
+                "usage": usage if isinstance(usage, dict) else {},
+            }
+
+        except JevError:
+            raise
+        except urllib.error.HTTPError as exc:
+            last_status = exc.code
+            last_body = _error_body(exc)
+            if last_status in (429, 503, 529) and attempt < MAX_RETRIES:
+                time.sleep(2**attempt)
+                continue
+            readable = {
+                401: "jevtypesafeai HTTP 401: API key rejected. Use a jv_live_ key from jevtypesafeai.com.",
+                402: f"jevtypesafeai HTTP 402: insufficient credits — top up at jevtypesafeai.com. {last_body}",
+                403: "jevtypesafeai HTTP 403: account is not active.",
+                422: f"jevtypesafeai HTTP 422: request body rejected. {last_body}",
+                429: f"jevtypesafeai HTTP 429: rate limited after {MAX_RETRIES} retries. {last_body}",
+                503: f"jevtypesafeai HTTP 503: billing temporarily unavailable after {MAX_RETRIES} retries. {last_body}",
+                529: f"jevtypesafeai HTTP 529: provider overloaded after {MAX_RETRIES} retries. {last_body}",
+            }.get(last_status, f"jevtypesafeai HTTP {last_status}: {last_body}")
+            raise JevError(readable, last_status) from None
+        except (TimeoutError, socket.timeout) as exc:
+            if attempt < MAX_RETRIES:
+                time.sleep(2**attempt)
+                continue
+            raise JevError(f"jevtypesafeai request timed out after {timeout}s") from exc
+        except urllib.error.URLError as exc:
+            reason = redact_secrets(getattr(exc, "reason", exc))
+            if attempt < MAX_RETRIES:
+                time.sleep(2**attempt)
+                continue
+            raise JevError(f"jevtypesafeai request failed: {reason}") from None
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise JevError(f"jevtypesafeai returned invalid JSON: {redact_secrets(exc)}") from None
+
+    raise JevError(
+        f"jevtypesafeai HTTP {last_status}: exhausted retries. {last_body}", last_status
+    )
 
 
 def _ask_openrouter(state: dict, questions: dict, key: str, model: str, timeout: float) -> dict:
@@ -205,6 +287,10 @@ def _check_openrouter_key(key: str, timeout: float) -> None:
 
 def list_models(provider: str, key: str, timeout: float = 10) -> list[str]:
     """某家能用的 Jev 模型 id，去重排序。失败抛 JevError（设置页直接显示这句话）。"""
+    if provider == "jevtypesafeai":
+        # 转卖网关只暴露单个 Jev 模型，无 /models 列表、也无免费探测端点。
+        # 直接给出默认 id，key 对不对由第一次真实判断兜底。
+        return ["jev-latest"]
     if provider == "typesafe":
         import typesafe_sdk
 
@@ -316,6 +402,50 @@ if __name__ == "__main__":
         assert ask({"chat": {}}, questions) == body
     assert seen["url"] == OPENROUTER_DECISIONS
     assert seen["body"]["model"] == "typesafe/jev-1.13" and seen["body"]["questions"] == questions
+
+    # jevtypesafeai.com resale gateway: same {model, state, questions} payload, but
+    # the response is already {model, answers, usage} (answers in TypeSafe's shape),
+    # so the adapter returns answers/usage directly — no envelope to unwrap.
+    jts_body = {
+        "model": "jev-latest",
+        "answers": {
+            "best_reply": {
+                "type": "choice", "choice": "reply_c", "confidence": 0.6,
+                "probabilities": {"reply_a": 0.2, "reply_b": 0.2, "reply_c": 0.6},
+            }
+        },
+        "usage": {"input_tokens": 9, "output_tokens": 0,
+                  "cost_usd": 0.000004, "credits_remaining_usd": 4.999996},
+    }
+
+    def _fake_jts(req, timeout=None):
+        seen["jts_url"] = req.full_url
+        seen["jts_auth"] = req.headers["Authorization"]
+        seen["jts_body"] = json.loads(req.data.decode("utf-8"))
+        return io.BytesIO(json.dumps(jts_body).encode("utf-8"))
+
+    with patch.object(urllib.request, "urlopen", _fake_jts):
+        got = ask({"chat": {}}, questions, provider="jevtypesafeai", model="jev-latest")
+
+    assert seen["jts_url"] == JEVTYPESAFEAI_DECISIONS
+    assert seen["jts_auth"] == "Bearer ts-key"
+    assert seen["jts_body"]["model"] == "jev-latest"
+    assert seen["jts_body"]["questions"] == questions
+    assert got == {"answers": jts_body["answers"], "usage": jts_body["usage"]}
+    assert list_models("jevtypesafeai", "unused") == ["jev-latest"]
+
+    # 402 余额不足要报一句人话，且不带出 key
+    def _fake_jts_402(req, timeout=None):
+        raise urllib.error.HTTPError(
+            JEVTYPESAFEAI_DECISIONS, 402, "Payment Required", {},
+            io.BytesIO(b'{"error":"Insufficient credits","code":"insufficient_credits"}'))
+
+    with patch.object(urllib.request, "urlopen", _fake_jts_402):
+        try:
+            ask({"chat": {}}, questions, provider="jevtypesafeai")
+            raise SystemExit("应当抛错")
+        except JevError as e:
+            assert e.status == 402 and "insufficient credits" in str(e).lower()
 
     # OpenRouter 路的列表是写死的，但 key 要过 auth/key 探测：mock urlopen 验两头
     def _fake_key_ok(req, timeout=None):
