@@ -20,18 +20,20 @@ def _engine(app: ChatApp = DEFAULT):
     RapidOCR 的内置模型只有中英文，韩日文全是乱码，所以这类界面走 Windows 自带 OCR
     （离线、随系统语言包装好，见 app/ocr_windows.py）；没有对应识别器就退回 RapidOCR。"""
     want = app.ocr if app.ocr not in _FELL_BACK else "rapidocr"
-    if want not in _ENGINES:
+    key = f"{want}:{app.ocr_lang}" if want == "windows" else want
+    if key not in _ENGINES:
         if want == "windows":
             try:
                 from app.ocr_windows import WindowsOcr
-                _ENGINES[want] = WindowsOcr()
+                # 指定语言，别让系统首选语言决定识别器：中文系统上韩文界面会挑到中文模型
+                _ENGINES[key] = WindowsOcr(app.ocr_lang or None)
             except Exception:
                 _FELL_BACK.add("windows")
                 return _engine(app)
         else:
-            _ENGINES[want] = RapidOCR(intra_op_num_threads=4, det_limit_type="max",
-                                      det_limit_side_len=4000)
-    return _ENGINES[want]
+            _ENGINES[key] = RapidOCR(intra_op_num_threads=4, det_limit_type="max",
+                                     det_limit_side_len=4000)
+    return _ENGINES[key]
 
 
 def read_title(header, app: ChatApp = DEFAULT):
@@ -100,6 +102,7 @@ class Reader:
         skip = self.app.trim_top(chat)   # 群聊置顶公告等：不是消息，整块跳过
         if skip:
             chat = chat[skip:]
+        # 裁掉的高度要加回调试框的 y：调试窗按整块消息区画，不然框会整体上移 skip 像素
         t0 = time.perf_counter()
         res, _ = self.ocr(chat, use_cls=False)
         self.last_ms = int((time.perf_counter() - t0) * 1000)
@@ -112,7 +115,7 @@ class Reader:
         for box, text, _ in sorted(res or [], key=lambda r: r[0][0][1]):
             kind, bg, h = who_said(chat, box, self.app)
             xs, ys = [p[0] for p in box], [p[1] for p in box]
-            rect = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
+            rect = (int(min(xs)), int(min(ys)) + skip, int(max(xs)), int(max(ys)) + skip)
             # 印在面板底色上的字都不是消息：气泡自带底色。微信的发言人名是灰字，
             # KakaoTalk 的是深色（对比度跟正文一样），所以不能只看 kind == "gray"。
             on_pane = np.abs(bg - pane_bg).sum() <= 6

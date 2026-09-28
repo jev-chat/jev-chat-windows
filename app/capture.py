@@ -56,7 +56,12 @@ def find_chat_hwnd(want=None):
             hit = next((f for f in mine if f[1] == app.main_title), None)
             if hit:
                 return hit[0], app
-        rooms = [f for f in mine if f[1] not in app.skip_titles] or mine
+        rooms = [f for f in mine if f[1] not in app.skip_titles]
+        if not rooms:
+            if app.skip_titles:
+                # 只开着主列表：那上面没有对话，采它只会读出联系人名单。让用户先打开一个聊天窗口。
+                raise RuntimeError(f"{app.label}: 请先打开一个聊天窗口（主列表窗里没有对话）")
+            rooms = mine
         best = max(rooms, key=lambda f: f[2])
         return best[0], app
     raise RuntimeError("没找到聊天窗口，开着吗？")

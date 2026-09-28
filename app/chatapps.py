@@ -43,17 +43,19 @@ class ChatApp:
     main_title: str              # preferred top-level window title; "" = pick the biggest window
     skip_titles: tuple[str, ...]  # windows that are never a conversation (roster, toasts)
     ocr: str                     # "rapidocr" (zh/en) or "windows" (Windows.Media.Ocr, ko/ja/...)
+    ocr_lang: str                # BCP-47 tag for the "windows" backend; "" = user profile order
     join: str                    # how OCR fragments inside one bubble are glued
     is_me: Callable[[np.ndarray], bool]
     trim_top: Callable[[np.ndarray], int] = lambda chat: 0  # rows to skip (pinned notice, ...)
 
 
 WECHAT = ChatApp("wechat", "微信", ("weixin.exe", "wechat.exe"), "微信", (),
-                 "rapidocr", "", _wechat_me)
+                 "rapidocr", "", "", _wechat_me)
 # KakaoTalk opens one window per conversation, so the roster ("카카오톡") is never the target;
 # the biggest remaining window is the chat that is actually being read.
+# ocr_lang="ko" 是必须的：只按用户首选语言挑识别器，系统首选是中文或英文时会选错。
 KAKAOTALK = ChatApp("kakaotalk", "카카오톡", ("kakaotalk.exe",), "", ("카카오톡", ""),
-                    "windows", " ", _kakao_me, _kakao_notice_rows)
+                    "windows", "ko", " ", _kakao_me, _kakao_notice_rows)
 
 APPS = {a.key: a for a in (WECHAT, KAKAOTALK)}
 DEFAULT = WECHAT
@@ -70,6 +72,7 @@ def get(key: str | None) -> ChatApp:
 if __name__ == "__main__":  # 自测：颜色规则用实测像素锁住，改错了当场炸
     assert by_exe("kakaotalk.exe") is KAKAOTALK and by_exe("weixin.exe") is WECHAT
     assert by_exe("chrome.exe") is None and get(None) is DEFAULT and get("kakaotalk") is KAKAOTALK
+    assert KAKAOTALK.ocr_lang == "ko" and WECHAT.ocr_lang == ""
     kakao_bubble, kakao_other, kakao_ground = (254, 229, 0), (255, 255, 255), (186, 206, 224)
     assert KAKAOTALK.is_me(np.array(kakao_bubble))
     assert not KAKAOTALK.is_me(np.array(kakao_other))

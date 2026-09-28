@@ -52,9 +52,16 @@ class WindowsOcr:
     def language(self) -> str:
         return self._engine.recognizer_language.language_tag
 
+    def _scale_for(self, h: int, w: int) -> int:
+        """Windows 拒绝超过 MaxImageDimension 的图，放大前先按它收一收。
+        属性名在 winsdk 里是 snake_case；取不到就按官方下限 2600 兜底。"""
+        limit = getattr(OcrEngine, "max_image_dimension", 0) or 2600
+        return max(1, min(SCALE, limit // max(1, max(h, w))))
+
     def __call__(self, img: np.ndarray, use_cls: bool = False):
-        if SCALE > 1:
-            img = np.repeat(np.repeat(img, SCALE, axis=0), SCALE, axis=1)
+        scale = self._scale_for(*img.shape[:2])
+        if scale > 1:
+            img = np.repeat(np.repeat(img, scale, axis=0), scale, axis=1)
         h, w = img.shape[:2]
         bgra = np.dstack([img[:, :, ::-1], np.full((h, w, 1), 255, np.uint8)])
         buf = CryptographicBuffer.create_from_byte_array(bgra.tobytes())
@@ -62,7 +69,7 @@ class WindowsOcr:
                                                         BitmapAlphaMode.PREMULTIPLIED)
         result = self._loop.run_until_complete(_recognize(self._engine, bitmap))
         # boxes go back in source pixels: app/ocr.py indexes the original frame with them
-        return [run for line in result.lines for run in _runs(line, SCALE)], None
+        return [run for line in result.lines for run in _runs(line, scale)], None
 
     def close(self):
         self._loop.close()
@@ -109,6 +116,12 @@ if __name__ == "__main__":  # 自测：分段和坐标还原不碰引擎，没�
         def __init__(self, words):
             self.words = words
 
+    engine = WindowsOcr.__new__(WindowsOcr)   # 不建引擎也能测放大上限
+    cap = getattr(OcrEngine, "max_image_dimension", 0) or 2600
+    assert engine._scale_for(100, 100) == SCALE           # 小图照常放大
+    assert engine._scale_for(cap, cap) == 1               # 已经顶到上限，不能再放大
+    assert engine._scale_for(cap // SCALE, 10) == SCALE   # 刚好放得下
+    assert engine._scale_for(cap // SCALE + 1, 10) < SCALE
     line = _L([_W(_R(0, 40), "배포"), _W(_R(45, 40), "안"), _W(_R(400, 30), "오전")])
     runs = _runs(line)
     assert [t for _, t, _ in runs] == ["배포 안", "오전"], runs
