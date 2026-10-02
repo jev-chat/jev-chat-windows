@@ -44,9 +44,11 @@
 
 设置页的「模型」卡片分两节，各填一把 key：
 
-1. **判断 · Jev** —— 判断意图、紧张度，并给三条候选排序。来源选 **OpenRouter**（默认，key 在
-   [openrouter.ai](https://openrouter.ai/) 申请）或 **TypeSafe 直连**（key 在
-   [console.typesafe.ai](https://console.typesafe.ai/) 申请）。填的是哪家的 key 看你上面选了哪家。
+1. **判断 · Jev** —— 判断意图、紧张度，并给三条候选排序。默认来源 **OpenRouter**（key 在
+   [openrouter.ai](https://openrouter.ai/) 申请），也可选 **TypeSafe 直连**（key 在
+   [console.typesafe.ai](https://console.typesafe.ai/) 申请）；另有一个**默认不选的可选第三方社区来源
+   JevAI Community**（数据会改发到新的第三方地址，选前请看下方「隐私与边界」的出网说明）。
+   填的是哪家的 key 看你上面选了哪家。
 2. **起草 · 语言模型** —— 写那三条候选。默认 **DeepSeek 官网**直连，key 在
    [platform.deepseek.com](https://platform.deepseek.com/) 申请（很便宜，起草一次几厘钱）。
    换别家见下面的表，OpenAI / Anthropic / Gemini 三种接口都支持。
@@ -117,7 +119,8 @@ RapidOCR 自带的只有中英文模型，韩文整段都是乱码：同一个 K
 - **调试视图**（可选）：另开一个窗口，实时画出截到的画面和每个识别框——绿 = 我、蓝 = 对方、
   灰 = 过滤掉的灰字、橙 = 当成发言人名、红 = 当成图片丢掉、黄 = 小字丢掉，外加消息区和头部的框、
   OCR 耗时、这一帧读出来的每一行。识别不对时一眼看出是哪一步的锅。只在内存里画，不存图。
-- **两个模型都能换**：判断走 OpenRouter 或 TypeSafe 直连；起草有 12 家预设（默认 DeepSeek 官网），
+- **两个模型都能换**：判断默认走 OpenRouter，也可换 TypeSafe 直连，或手动选默认不选的第三方
+  JevAI Community；起草有 12 家预设（默认 DeepSeek 官网），
   OpenAI / Anthropic / Gemini 三种协议都支持，也能填自己的 Base URL。全程只要两把 key。
 - **思考模式开关**：默认关；开了模型先想再写，更斟酌但慢好几倍、贵一些。
 - **参考上下文条数**：3~30，默认 10，起草和判断都按它取最近 N 条。
@@ -150,13 +153,31 @@ RapidOCR 自带的只有中英文模型，韩文整段都是乱码：同一个 K
   不夹带任何聊天内容；设置里「启动时检查更新」关掉就完全不发这个请求，源码直接跑（没有版本号）也
   不会发。
 
-什么会出网：判断（`JEV_API_KEY`）去你选的 OpenRouter 或 TypeSafe 直连；起草（`LLM_API_KEY`）发给你
+什么会出网：**判断/排序**（`JEV_API_KEY`）发给你在设置里选的判断来源——默认 **OpenRouter**
+（`openrouter.ai`），或 **TypeSafe 直连**（`api.typesafe.ai`）；**起草**（`LLM_API_KEY`）发给你
 在设置里选的那家接口（DeepSeek 官网、OpenRouter、OpenAI、Moonshot、智谱、通义、硅基流动、
 OpenCode Go、Anthropic、Gemini，或者自填的 OpenAI 兼容 / Anthropic 兼容地址），加上启动时（可关）一次到
-GitHub 查版本号。**本项目没有任何自建服务器**，聊天内容只在触发分析的那一刻，发给你自己在设置里
-配置的那个接口，本项目不收集、不落盘、不进日志。发出去的内容固定是：**最近 N 条对话文本**（N =
-设置里的「参考上下文」，默认 10；群聊带发言人名）、**关系设置**、**你自己最近 12 条 60 字以内的短
-消息**（当口吻样本，链接和长段不送）、**你填的说话风格**，群聊指定了回复对象的话再加一个对象名。
+GitHub 查版本号。**本项目没有任何自建服务器**，数据只在触发分析的那一刻，发给你自己在设置里
+配置的那个接口，本项目不收集、不落盘、不进日志。两次请求发送的内容不一样：
+
+- **判断/排序请求**固定发送：**关系设置**、**最近 N 条对话文本**（N = 设置里的「参考上下文」，
+  默认 10；群聊带发言人名），群聊指定了回复对象的话再加一个对象名，外加那套固定的 Jev 判断题。
+  它**不**发送你填的说话风格，也不发送下面那条起草专用的口吻样本。
+- **起草请求**才会额外发送**你自己最近 12 条 60 字以内的短消息**（当口吻样本，链接和长段不送）和
+  **你填的说话风格**。
+
+> **可选第三方来源 · JevAI Community（默认不选，务必知情）**
+>
+> 只有当你在「判断 · 来源」里**手动主动选择 JevAI Community** 时，上面的**判断/排序请求**——即判断和
+> 排序所需的聊天上下文/状态（关系设置 + 最近 N 条对话文本，群聊带发言人名、指定回复对象时带对象名）和
+> 固定的 Jev 判断题——才会改发到一个**新的第三方接收方：https://www.jevai.org/**
+> （决策接口 `https://www.jevai.org/api/v1/decisions`）。不选就仍是 OpenRouter 或 TypeSafe 直连，
+> 这两条路的行为和数据去向完全不变。
+>
+> JevAI Community 是**第三方社区运营**的可选来源，**不是默认来源、不是本项目自建，也不由
+> JevChat-Windows 维护者运营**；它的隐私、额度、定价与服务政策均由该第三方独立制定、可能随时变化，
+> 选用前请自行阅读其条款。本项目不会替你切换来源——只有你显式选择后数据才会发往该地址。
+
 除此之外没有别的。OCR 全程离线。GitHub 版本查询只带 UA 和当前版本号，不夹带任何聊天内容。
 
 **会不会因此被封号？** 本项目不 hook、不注入、不读对方的数据库或进程内存、不调用对方的任何
@@ -187,6 +208,11 @@ WGC 截聊天窗口（GPU 合成窗口也能截，被遮挡也能截）
 | --- | --- | --- |
 | OpenRouter（默认） | `openrouter.ai/api/alpha/decisions` | `typesafe/jev-1.13` |
 | TypeSafe 直连 | `api.typesafe.ai`（官方 `typesafe-sdk`） | `jev-latest` |
+| JevAI Community（可选 · 第三方社区运营 · 默认不选） | `www.jevai.org/api/v1/decisions` | `typesafe-ai/jev` |
+
+> JevAI Community 是**可选的第三方社区来源**：只有你手动选中，判断/排序的聊天上下文才会改发到
+> www.jevai.org；它不是默认来源，也不由 JevChat-Windows 维护者运营，隐私/额度/定价/服务政策由第三方
+> 独立制定。详见上文「隐私与边界」的出网说明。OpenRouter / TypeSafe 的行为不受影响。
 
 **起草 3 条候选（key：`LLM_API_KEY`）**
 
@@ -209,8 +235,8 @@ WGC 截聊天窗口（GPU 合成窗口也能截，被遮挡也能截）
 OpenCode Go 的列表只留走 `/chat/completions` 的模型（DeepSeek、GLM、Kimi、MiMo 等）；
 MiniMax、Qwen 走 `/messages`，Grok、GPT 走 `/responses`，选了会失败，所以不放进下拉框。
 三种协议各走自家官方 SDK（`openai` / `anthropic` / `google-genai`），不自己拼 HTTP；
-判断那条 OpenRouter 的路是唯一的例外——`typesafe-sdk` 把路径写死成 `/v1/systemone`，
-打不到 OpenRouter 的 `/api/alpha/decisions`。
+判断里 OpenRouter 和可选的 JevAI Community 是手写 urllib 的例外——`typesafe-sdk` 把路径写死成
+`/v1/systemone`，既打不到 OpenRouter 的 `/api/alpha/decisions`，也不是 JevAI Community 的地址。
 
 两节各一把 key，都必填。链路是**三段式**（issue #4）：先让 Jev 答 7 道判断题，把
 「对方意图 / 对方需要 / 建议动作 / 紧张度」折成一小段中文小抄喂给起草，三条候选都顺着这个判断写；
@@ -247,8 +273,8 @@ MiniMax、Qwen 走 `/messages`，Grok、GPT 走 `/responses`，选了会失败�
 - **Python 3.10–3.12**（Releases 里的 exe 是 CI 用 3.11 打的；只想用 exe 的话不用装 Python。3.13+ 不行：rapidocr-onnxruntime 1.4.x 官方包 requires_python 封顶 <3.13，pip 会静默改装 1.2.3，启动即 KeyError）
 - **聊天窗口**
 - **两把 API key**：判断用 `JEV_API_KEY`，默认来源 [OpenRouter](https://openrouter.ai/)（或
-  [TypeSafe 直连](https://console.typesafe.ai/)）；起草用 `LLM_API_KEY`，默认
-  [DeepSeek 官网](https://platform.deepseek.com/)。详见下面「使用说明」
+  [TypeSafe 直连](https://console.typesafe.ai/)；另有默认不选的可选第三方 JevAI Community）；起草用
+  `LLM_API_KEY`，默认 [DeepSeek 官网](https://platform.deepseek.com/)。详见下面「使用说明」
 
 > Win10 上 WGC 会在目标窗口外画一圈黄框，系统不给关；Win11 才能关掉。
 > 嫌碍眼就把标题栏的采集开关拨到「已暂停」，黄框立刻消失。
@@ -297,7 +323,7 @@ pyinstaller --noconfirm --clean jev.spec
 | 群聊指定回复对象 | 开了群聊里才有「回复对象」那一行，候选针对 TA 写 | `config.json` → `reply_target`（默认关） |
 | 启动时检查更新 | 开了才在启动时查一次 GitHub 最新版本号，有新版本就在标题栏下面提示 | `config.json` → `check_update`（默认开） |
 | 调试视图 | 另开一个窗口实时显示截到的画面和识别框，看识别在哪一步认错。拨一下立刻生效，不用点保存；关掉那个窗口等于关掉开关 | `config.json` → `debug_view`（默认关） |
-| 判断 · 来源 | OpenRouter 还是 TypeSafe 直连 | `config.json` → `jev_provider`（默认 `openrouter`） |
+| 判断 · 来源 | OpenRouter（默认）/ TypeSafe 直连 / 可选第三方 JevAI Community（默认不选） | `config.json` → `jev_provider`（默认 `openrouter`） |
 | 判断 · 密钥 | 上面选哪家就填哪家的 key。已配置时留空 = 保留 | 注册表 `HKCU\Environment` → `JEV_API_KEY` |
 | 判断 · 模型 | 可手打，也可点「获取模型」拉列表挑 | `config.json` → `jev_model`（空 = 该来源默认） |
 | 起草 · 来源 | 上面那张表里的任意一家 | `config.json` → `draft_provider`（默认 `deepseek`） |
@@ -347,7 +373,7 @@ core/                   Jev 判断内核，平台无关，跟安卓原版同一�
   engine.py             唯一入口 analyze(messages, relationship) → 候选 + 排序 + 判断
   providers.py          两张来源表（判断 / 起草）：协议、地址、默认模型；纯数据，不认 key
   llm.py                三种协议的薄适配层，一律走官方 SDK：openai / anthropic / google-genai
-  jev_client.py         Jev 判断客户端：OpenRouter（urllib）/ TypeSafe 直连（typesafe-sdk）；脱敏、退避
+  jev_client.py         Jev 判断客户端：OpenRouter（urllib）/ TypeSafe 直连（typesafe-sdk）/ 可选 JevAI Community（urllib，响应严格校验，畸形即报错走兜底）；脱敏、退避
   questions.py          7 道判断题 + build_state() + build_rank_question() + 判断小抄 guidance_text() / 中文标签 CHOICE_LABELS
   draft.py              起草 3 条候选：拼提示词、解析、过滤、不足时追问补齐；调用走 llm.py
 tools/

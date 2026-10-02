@@ -105,7 +105,13 @@ def analyze(messages: list, relationship: str, model: str | None = None,
 
 if __name__ == "__main__":
     # 候选被过滤光时要抛 JevError，不能在取第一条时 IndexError。
+    import io
+    import json
+    import os
+    import urllib.request
     from unittest.mock import patch
+
+    os.environ.setdefault("JEV_API_KEY", "self-test-key")
 
     with patch("__main__.ask", return_value={"answers": {}, "usage": {}}), \
          patch("__main__.draft_candidates", return_value=[]):
@@ -114,4 +120,52 @@ if __name__ == "__main__":
             raise SystemExit("应当抛错")
         except JevError as e:
             assert "没有可用候选" in str(e)
+
+    # PR #38：JevAI HTTP/envelope 成功但 answers 畸形 → 校验抛 JevError →
+    # 第一次判定不算成功（盲起草、guidance=None）→ 走老路（判断+排序一次合问）。
+    def _valid_answers(qs: dict) -> dict:
+        out = {}
+        for name, q in qs.items():
+            kind = q["type"]
+            if kind == "noul":
+                out[name] = {"type": "noul", "noul": 0.8}
+            elif kind == "choice":
+                keys = list(q["criteria"])
+                out[name] = {"type": "choice", "choice": keys[0], "confidence": 1.0,
+                             "probabilities": {k: (1.0 if k == keys[0] else 0.0)
+                                               for k in keys}}
+            else:
+                levels = len(q["criteria"])
+                peak = min(4, levels - 1)
+                out[name] = {"type": "score", "score": float(peak), "confidence": 1.0,
+                             "probabilities": {str(i): (1.0 if i == peak else 0.0)
+                                               for i in range(levels)}}
+        return out
+
+    seen_requests = []
+
+    def _fake_urlopen(req, timeout=None):
+        body = json.loads(req.data.decode("utf-8"))
+        seen_requests.append(body)
+        # 第一次（只判 7 题）回畸形空答案；第二次（兜底合问，含 best_reply）回合法答案
+        answers = _valid_answers(body["questions"]) if "best_reply" in body["questions"] else {}
+        return io.BytesIO(json.dumps(
+            {"code": 0, "message": "ok",
+             "data": {"answers": answers, "usage": {}}}).encode("utf-8"))
+
+    captured = {}
+
+    def _fake_draft(messages, relationship, **kwargs):
+        captured["guidance"] = kwargs.get("guidance")
+        return ["候选甲", "候选乙", "候选丙"]
+
+    with patch.object(urllib.request, "urlopen", _fake_urlopen), \
+         patch("__main__.draft_candidates", _fake_draft):
+        result = analyze([("her", "你还在乎我吗")], "friends", jev_provider="jevai")
+
+    assert captured["guidance"] is None, "畸形判定不能被当成成功，必须盲起草"
+    assert len(seen_requests) == 2, "畸形判定后应再发一次兜底合问"
+    second_q = seen_requests[1]["questions"]
+    assert "best_reply" in second_q and "true_intent" in second_q, "兜底必须判断+排序合问"
+    assert result["answers"]["best_reply"]["choice"] == "reply_a"
     print("engine ok")
