@@ -144,8 +144,11 @@ def main() -> int:
 
     def fake_jev_models(provider, key, timeout=10):
         """演示不联网：给一小撮假模型，让「获取模型」按钮在本地也走得通。"""
-        return (["typesafe/jev-1.13"] if provider == "openrouter"
-                else ["jev-1.13.0", "jev-latest", "jev-preview"])
+        if provider == "openrouter":
+            return ["typesafe/jev-1.13"]
+        if provider == "opencode":
+            return ["jev-1.13", "jev-1.13-free"]
+        return ["jev-1.13.0", "jev-latest", "jev-preview"]
 
     def fake_llm_models(protocol, base_url, api_key, timeout=10):
         return {"anthropic": ["claude-demo-4", "claude-demo-4-mini"],

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Jev 判断 API 客户端：OpenRouter 或 TypeSafe 直连。
+"""Jev 判断 API 客户端：OpenRouter、OpenCode Zen 或 TypeSafe 直连。
 
-TypeSafe 直连走官方 `typesafe_sdk`；OpenRouter 这条是唯一自己拼 HTTP 的路——
-SDK 把路径写死成 `/v1/systemone`，打不到 OpenRouter 的 `/api/alpha/decisions`。
-两条路返回同一个 dict 形状，engine 不关心跑的是哪条。key 只从环境变量读，绝不打进日志。
+TypeSafe 直连走官方 `typesafe_sdk`；OpenRouter Decisions 和 OpenCode Zen System One
+都是自己拼 HTTP。三条路返回同一个 dict 形状，engine 不关心跑的是哪条。
+key 只从环境变量读，绝不打进日志。
 """
 
 from __future__ import annotations
@@ -18,9 +18,13 @@ from typing import NoReturn
 
 try:  # 当模块导入 / 当脚本直接跑 都能用
     from .providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY,
+                            OPENCODE_USER_AGENT, OPENCODE_ZEN_MODELS,
+                            OPENCODE_ZEN_SYSTEMONE,
                             OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
 except ImportError:
     from providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY,
+                           OPENCODE_USER_AGENT, OPENCODE_ZEN_MODELS,
+                           OPENCODE_ZEN_SYSTEMONE,
                            OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
 
 MAX_RETRIES = 3
@@ -89,15 +93,18 @@ def ask(state: dict, questions: dict, timeout: float = 20,
         provider: str = "openrouter", model: str | None = None) -> dict:
     """问 Jev 一轮判断，返回 {"answers": {名字: 答案}, "usage": {...}}。
 
-    provider ∈ JEV_PROVIDERS（openrouter / typesafe 直连）；model=None 用该来源的默认模型。
-    两条路返回的 dict 形状一模一样，429/529 都会退避重试。绝不打印或写出 key。
+    provider ∈ JEV_PROVIDERS（openrouter / typesafe / opencode）；model=None 用该来源的默认模型。
+    三条路返回的 dict 形状一模一样，429/529 都会退避重试。绝不打印或写出 key。
     """
-    spec = JEV_PROVIDERS.get(provider) or JEV_PROVIDERS["openrouter"]
-    key = _api_key(JEV_ENV)  # 两家共用同一把 key，换来源不用重填
+    provider = provider if provider in JEV_PROVIDERS else "openrouter"
+    spec = JEV_PROVIDERS[provider]
+    key = _api_key(JEV_ENV)  # 三家共用同一把 key，换来源不用重填
     model = model or spec.default
     if provider == "typesafe":
         return _ask_typesafe(state, questions, key, model, timeout)
-    return _ask_openrouter(state, questions, key, model, timeout)
+    endpoint = OPENCODE_ZEN_SYSTEMONE if provider == "opencode" else OPENROUTER_DECISIONS
+    headers = {"User-Agent": OPENCODE_USER_AGENT} if provider == "opencode" else None
+    return _ask_http(endpoint, state, questions, key, model, timeout, headers)
 
 
 def _answer(answer) -> dict:
@@ -131,8 +138,9 @@ def _ask_typesafe(state: dict, questions: dict, key: str, model: str, timeout: f
     }
 
 
-def _ask_openrouter(state: dict, questions: dict, key: str, model: str, timeout: float) -> dict:
-    """OpenRouter 的 /api/alpha/decisions，手写 urllib。429/529 退避重试 3 次。"""
+def _ask_http(endpoint: str, state: dict, questions: dict, key: str, model: str,
+              timeout: float, headers: dict[str, str] | None = None) -> dict:
+    """System One JSON 接口（OpenRouter Decisions / OpenCode Zen），手写 urllib。"""
     payload = json.dumps(
         {"model": model, "state": state, "questions": questions},
         ensure_ascii=False,
@@ -142,13 +150,14 @@ def _ask_openrouter(state: dict, questions: dict, key: str, model: str, timeout:
     last_body = ""
     for attempt in range(MAX_RETRIES + 1):
         req = urllib.request.Request(
-            OPENROUTER_DECISIONS,
+            endpoint,
             data=payload,
             method="POST",
             headers={
                 "Authorization": f"Bearer {key}",
                 "Content-Type": "application/json; charset=utf-8",
                 "Accept": "application/json",
+                **(headers or {}),
             },
         )
         try:
@@ -203,8 +212,50 @@ def _check_openrouter_key(key: str, timeout: float) -> None:
             f"取模型列表失败: {redact_secrets(getattr(exc, 'reason', exc))}") from None
 
 
+def _list_opencode_models(key: str, timeout: float) -> list[str]:
+    """OpenCode Zen 的 /v1/models；只留下 jev- 前缀的模型。"""
+    req = urllib.request.Request(
+        OPENCODE_ZEN_MODELS,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+            "User-Agent": OPENCODE_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        hint = {401: "密钥被拒", 403: "没有权限"}.get(exc.code, "")
+        detail = _error_body(exc)[:300]
+        message = f"{hint}: {detail}" if hint and detail else (hint or detail)
+        raise JevError(f"取模型列表 HTTP {exc.code}: {message}") from None
+    except (TimeoutError, socket.timeout):
+        raise JevError(f"取模型列表请求超时（{timeout}s）") from None
+    except urllib.error.URLError as exc:
+        raise JevError(
+            f"取模型列表失败: {redact_secrets(getattr(exc, 'reason', exc))}") from None
+    except (UnicodeDecodeError, ValueError):
+        raise JevError("取模型列表返回格式不对") from None
+    rows = payload.get("data", payload.get("models", [])) if isinstance(payload, dict) else []
+    ids = []
+    for row in rows if isinstance(rows, list) else []:
+        if isinstance(row, str):
+            model_id = row
+        elif isinstance(row, dict):
+            model_id = row.get("id") or row.get("name") or ""
+        else:
+            continue
+        model_id = str(model_id).strip()
+        if model_id.startswith("jev-"):
+            ids.append(model_id)
+    return sorted(set(ids))
+
+
 def list_models(provider: str, key: str, timeout: float = 10) -> list[str]:
     """某家能用的 Jev 模型 id，去重排序。失败抛 JevError（设置页直接显示这句话）。"""
+    if provider == "opencode":
+        return _list_opencode_models(key, timeout)
     if provider == "typesafe":
         import typesafe_sdk
 
@@ -222,8 +273,8 @@ def list_models(provider: str, key: str, timeout: float = 10) -> list[str]:
 
 
 if __name__ == "__main__":
-    # ponytail: 不联网。两条路各测一次：SDK 那条在 typesafe_sdk 边界换成假客户端，
-    # urllib 那条 mock urlopen。会坏的地方就一个——答案对象 → dict 的映射得跟 JSON 那条一模一样。
+    # ponytail: 不联网。三条路各测一次：SDK 那条在 typesafe_sdk 边界换成假客户端，
+    # System One JSON 那两条 mock urlopen。会坏的地方就一个——答案对象 → dict 的映射得跟 JSON 一样。
     import io
     import types as _t
     from unittest.mock import patch
@@ -316,6 +367,32 @@ if __name__ == "__main__":
         assert ask({"chat": {}}, questions) == body
     assert seen["url"] == OPENROUTER_DECISIONS
     assert seen["body"]["model"] == "typesafe/jev-1.13" and seen["body"]["questions"] == questions
+
+    # OpenCode Zen 也打 System One JSON，只是模型 id 不带 typesafe/ 前缀
+    def _fake_zen_urlopen(req, timeout=None):
+        seen["zen_url"] = req.full_url
+        seen["zen_body"] = json.loads(req.data.decode("utf-8"))
+        assert req.headers["Authorization"] == "Bearer ts-key"
+        assert req.headers["User-agent"] == OPENCODE_USER_AGENT
+        return io.BytesIO(json.dumps(body).encode("utf-8"))
+
+    with patch.object(urllib.request, "urlopen", _fake_zen_urlopen):
+        assert ask({"chat": {}}, questions, provider="opencode",
+                   model="jev-1.13-free") == body
+    assert seen["zen_url"] == OPENCODE_ZEN_SYSTEMONE
+    assert seen["zen_body"]["model"] == "jev-1.13-free"
+    assert seen["zen_body"]["state"] == {"chat": {}}
+    assert seen["zen_body"]["questions"] == questions
+
+    def _fake_zen_models(req, timeout=None):
+        seen["zen_models_url"] = req.full_url
+        assert req.headers["Authorization"] == "Bearer zen-key"
+        assert req.headers["User-agent"] == OPENCODE_USER_AGENT
+        return io.BytesIO(b'{"data":[{"id":"gpt-6"},{"id":"jev-1.13-free"},{"id":"jev-1.13"}]}')
+
+    with patch.object(urllib.request, "urlopen", _fake_zen_models):
+        assert list_models("opencode", "zen-key") == ["jev-1.13", "jev-1.13-free"]
+    assert seen["zen_models_url"] == OPENCODE_ZEN_MODELS
 
     # OpenRouter 路的列表是写死的，但 key 要过 auth/key 探测：mock urlopen 验两头
     def _fake_key_ok(req, timeout=None):

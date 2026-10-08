@@ -52,7 +52,7 @@ def language() -> str:
     return str(_read("lang") or "zh").strip().lower()
 
 def jev_provider() -> str:
-    """判断模型走哪家：openrouter（默认）或 typesafe 直连。"""
+    """判断模型走哪家：openrouter（默认）、typesafe 直连或 opencode（OpenCode Zen）。"""
     v = _read("jev_provider")
     return v if v in JEV_PROVIDERS else _DEFAULT_JEV
 
@@ -136,7 +136,7 @@ def _notify_env() -> None:
         pass
 
 def jev_key() -> str:
-    """判断那把 key，两家来源共用。"""
+    """判断那把 key，三家来源共用。"""
     return _get_key(JEV_ENV)
 
 def has_jev_key() -> bool:
