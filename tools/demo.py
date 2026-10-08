@@ -3,7 +3,7 @@
 
 链路是三段式：Jev 判断（7 道题） → 带着判断起草 3 条 → Jev 排序，两次 Jev 调用。
 
-全程只要两把 key：判断一把 JEV_API_KEY（OpenRouter 或 TypeSafe 的），起草一把 LLM_API_KEY。
+全程只要两把 key：判断一把 JEV_API_KEY（OpenRouter / TypeSafe / OpenCode Zen 的），起草一把 LLM_API_KEY。
 
     set JEV_API_KEY=...   &  set LLM_API_KEY=...    (Windows)
     export JEV_API_KEY=... && export LLM_API_KEY=...(mac/Linux)
@@ -32,7 +32,7 @@ MESSAGES = [
 ]
 RELATIONSHIP = "romantic partners"
 PROVIDER = "deepseek"        # 起草来源，见 core.providers.DRAFT_PROVIDERS
-JEV_PROVIDER = "openrouter"  # 判断来源：openrouter 或 typesafe
+JEV_PROVIDER = "openrouter"  # 判断来源：openrouter / typesafe / opencode
 
 
 def fmt(name: str, ans: dict) -> str:
