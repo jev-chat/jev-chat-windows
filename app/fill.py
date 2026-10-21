@@ -72,8 +72,10 @@ def fill(hwnd, area, text):
     u32.GetCursorPos(ctypes.byref(old))
     u32.SetCursorPos(cx, cy)
     time.sleep(0.05)
-    u32.mouse_event(0x2, 0, 0, 0, 0)  # 左键按下
-    u32.mouse_event(0x4, 0, 0, 0, 0)  # 抬起
+    # mouse_event 用物理按键；按系统设置点击主键，兼容左右键互换（SM_SWAPBUTTON）
+    down, up = (0x8, 0x10) if u32.GetSystemMetrics(23) else (0x2, 0x4)
+    u32.mouse_event(down, 0, 0, 0, 0)
+    u32.mouse_event(up, 0, 0, 0, 0)
     time.sleep(0.05)
     u32.SetCursorPos(old.x, old.y)
     time.sleep(0.05)
