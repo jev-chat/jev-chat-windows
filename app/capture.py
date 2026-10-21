@@ -10,6 +10,16 @@ import numpy as np
 from app import chatapps
 
 u32 = ctypes.windll.user32
+u32.GetWindowDisplayAffinity.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+u32.GetWindowDisplayAffinity.restype = wintypes.BOOL
+
+
+def display_affinity(hwnd):
+    """窗口的采集限制；查询失败返回 None，保留原来的采集行为。"""
+    value = wintypes.DWORD()
+    if not u32.GetWindowDisplayAffinity(hwnd, ctypes.byref(value)):
+        return None
+    return value.value
 
 
 def find_chat_hwnd(want=None):
@@ -114,6 +124,8 @@ class Capture:
     新消息滑入的半截气泡）全跳过。动图表情永远停不稳，所以最多等 max_wait 秒照样交。"""
 
     def __init__(self, hwnd, settle=0.25, max_wait=1.0):
+        if display_affinity(hwnd) == 0x11:  # WDA_EXCLUDEFROMCAPTURE：WGC 可能一帧都收不到
+            raise RuntimeError("聊天窗口已禁止捕获（WDA_EXCLUDEFROMCAPTURE），Windows 不允许采集其画面。")
         from windows_capture import WindowsCapture
 
         self.settle, self.max_wait = settle, max_wait
