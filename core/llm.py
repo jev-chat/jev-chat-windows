@@ -44,6 +44,21 @@ def chat(protocol: str, base_url: str | None, api_key: str, model: str, system: 
                    temperature, max_tokens, extra_body, headers, timeout)
 
 
+def _aimlapi(base_url):
+    # 固定预设地址才启用；不跟随重定向，避免密钥发往其他地址。
+    from core.providers import AIMLAPI_BASE
+
+    return base_url is not None and base_url.rstrip("/") == AIMLAPI_BASE
+
+
+def _openai_transport(base_url):
+    if _aimlapi(base_url):
+        import openai
+
+        return {"http_client": openai.DefaultHttpxClient(follow_redirects=False)}
+    return {}
+
+
 def _openai(base_url, api_key, model, system, user_turns, temperature, max_tokens,
             extra_body, headers, timeout) -> str:
     import openai
@@ -51,6 +66,7 @@ def _openai(base_url, api_key, model, system, user_turns, temperature, max_token
     try:
         client = openai.OpenAI(base_url=base_url or None, api_key=api_key,
                                timeout=timeout, max_retries=2,
+                               **_openai_transport(base_url),
                                **({"default_headers": headers} if headers else {}))
         resp = client.chat.completions.create(
             model=model,
@@ -136,8 +152,16 @@ def list_models(protocol: str, base_url: str | None, api_key: str,
         try:
             client = openai.OpenAI(base_url=base_url or None, api_key=api_key,
                                    timeout=timeout, max_retries=1,
+                                   **_openai_transport(base_url),
                                    **({"default_headers": headers} if headers else {}))
-            ids = [m.id for m in client.models.list()]
+            if _aimlapi(base_url):
+                models = client.models.list(
+                    extra_query={"include": "all"},
+                    extra_headers={"Authorization": openai.Omit()})
+                ids = [m.id for m in models
+                       if getattr(m, "type", None) == "openai/chat-completions"]
+            else:
+                ids = [m.id for m in client.models.list()]
         except Exception as exc:
             _fail(exc, "取模型列表")
     return sorted(set(ids))
