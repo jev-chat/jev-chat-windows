@@ -12,6 +12,8 @@ from __future__ import annotations
 import uuid
 from collections import namedtuple
 
+AIMLAPI_BASE = "https://api.aimlapi.com/v1"
+
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"  # OpenAI 兼容；auth/key 探测也挂在它下面
 # Jev 判断只有 OpenRouter 这条路要自己拼 HTTP：typesafe_sdk 把路径写死成 /v1/systemone，打不到这个地址
 OPENROUTER_DECISIONS = "https://openrouter.ai/api/alpha/decisions"
@@ -51,6 +53,7 @@ DRAFT_PROVIDERS = {  # 第一个就是默认：DeepSeek 官网直连
                        lambda on: {"thinking": {"type": "enabled" if on else "disabled"}}),
     "openrouter": _Draft("OpenRouter", "openai", OPENROUTER_BASE,
                          "deepseek/deepseek-v4.1-flash", lambda on: {"reasoning": {"enabled": on}}),
+    "aimlapi": _Draft("AI/ML API", "openai", AIMLAPI_BASE, "", _NONE),
     "openai": _Draft("OpenAI", "openai", "https://api.openai.com/v1", "", _NONE),
     "moonshot": _Draft("Moonshot (Kimi)", "openai", "https://api.moonshot.cn/v1", "", _NONE),
     "zhipu": _Draft("智谱 GLM", "openai", "https://open.bigmodel.cn/api/paas/v4", "", _NONE),

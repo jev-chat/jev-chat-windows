@@ -117,7 +117,7 @@ RapidOCR 自带的只有中英文模型，韩文整段都是乱码：同一个 K
 - **调试视图**（可选）：另开一个窗口，实时画出截到的画面和每个识别框——绿 = 我、蓝 = 对方、
   灰 = 过滤掉的灰字、橙 = 当成发言人名、红 = 当成图片丢掉、黄 = 小字丢掉，外加消息区和头部的框、
   OCR 耗时、这一帧读出来的每一行。识别不对时一眼看出是哪一步的锅。只在内存里画，不存图。
-- **两个模型都能换**：判断走 OpenRouter 或 TypeSafe 直连；起草有 12 家预设（默认 DeepSeek 官网），
+- **两个模型都能换**：判断走 OpenRouter 或 TypeSafe 直连；起草有 13 家预设（默认 DeepSeek 官网），
   OpenAI / Anthropic / Gemini 三种协议都支持，也能填自己的 Base URL。全程只要两把 key。
 - **思考模式开关**：默认关；开了模型先想再写，更斟酌但慢好几倍、贵一些。
 - **参考上下文条数**：3~30，默认 10，起草和判断都按它取最近 N 条。
@@ -194,6 +194,7 @@ WGC 截聊天窗口（GPU 合成窗口也能截，被遮挡也能截）
 | --- | --- | --- | --- |
 | DeepSeek 官网（默认） | OpenAI | `api.deepseek.com` | `deepseek-flash` |
 | OpenRouter | OpenAI | `openrouter.ai/api/v1` | `deepseek/deepseek-v4.1-flash` |
+| AI/ML API | OpenAI | `api.aimlapi.com/v1` | 自己选 |
 | OpenAI | OpenAI | `api.openai.com/v1` | 自己选 |
 | Moonshot (Kimi) | OpenAI | `api.moonshot.cn/v1` | 自己选 |
 | 智谱 GLM | OpenAI | `open.bigmodel.cn/api/paas/v4` | 自己选 |
@@ -206,6 +207,8 @@ WGC 截聊天窗口（GPU 合成窗口也能截，被遮挡也能截）
 | 自定义 · Anthropic 兼容 | Anthropic | 自己填 | 自己选 |
 
 没有默认模型的来源，在设置页点「获取模型」拉一次列表自己挑（也能直接手打模型 id）。
+AI/ML API 从公开的 `/models?include=all` 获取列表，只保留 `type=openai/chat-completions` 的模型。
+切换到 AI/ML API 时，请把起草密钥（`LLM_API_KEY`）换成该服务的密钥；所有起草来源共用同一个密钥槽。
 OpenCode Go 的列表只留走 `/chat/completions` 的模型（DeepSeek、GLM、Kimi、MiMo 等）；
 MiniMax、Qwen 走 `/messages`，Grok、GPT 走 `/responses`，选了会失败，所以不放进下拉框。
 三种协议各走自家官方 SDK（`openai` / `anthropic` / `google-genai`），不自己拼 HTTP；
@@ -422,7 +425,7 @@ config.json             你自己的设置，不进仓库（在 .gitignore 里�
 - 源码安装说明明确 Python 3.10–3.12；README 和设置页加入公众号「恸码奇点」入口
 
 **v0.1.9**
-- 设置页「模型」卡片：判断 · Jev（OpenRouter / TypeSafe 直连）+ 起草 · 语言模型（12 家预设 + 自定义
+- 设置页「模型」卡片：判断 · Jev（OpenRouter / TypeSafe 直连）+ 起草 · 语言模型（13 家预设 + 自定义
   Base URL），三种协议一律走官方 SDK（`openai` / `anthropic` / `google-genai`），可点「获取模型」拉
   接口的真实列表；**key 收敛成两把** `JEV_API_KEY` / `LLM_API_KEY`，换来源复用同一个槽，老的
   `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` 仍能读到，保存一次自动迁移
